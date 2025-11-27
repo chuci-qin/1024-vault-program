@@ -116,21 +116,30 @@ pub fn close_position_settle<'a>(
     )
 }
 
-/// 清算用户账户部分 (CPI)
+/// 清算用户账户 (CPI)
 /// 
-/// 注意: 清算罚金和穿仓覆盖由 Ledger Program 单独调用 Fund Program 处理
-/// 此函数仅更新用户账户状态
+/// 执行完整的清算资金处理:
+/// 1. 更新用户账户状态 (清空保证金, 返还剩余)
+/// 2. 将清算罚金从 Vault Token Account 转入 Insurance Fund Vault
 /// 
 /// # Arguments
 /// * `margin` - 用户锁定的保证金 (e6) - 将被清空
 /// * `user_remainder` - 返还给用户的剩余 (e6)
+/// * `liquidation_penalty` - 清算罚金 (e6) - 转入 Insurance Fund
+/// * `vault_token_account` - Vault 的 Token 账户 (源)
+/// * `insurance_fund_vault` - Insurance Fund 的 Token 账户 (目标)
+/// * `token_program` - SPL Token Program
 pub fn liquidate_position<'a>(
     vault_program_id: &Pubkey,
     vault_config: AccountInfo<'a>,
     user_account: AccountInfo<'a>,
     caller_program: AccountInfo<'a>,
+    vault_token_account: AccountInfo<'a>,
+    insurance_fund_vault: AccountInfo<'a>,
+    token_program: AccountInfo<'a>,
     margin: u64,
     user_remainder: u64,
+    liquidation_penalty: u64,
     signers_seeds: &[&[&[u8]]],
 ) -> ProgramResult {
     let instruction = Instruction {
@@ -139,17 +148,28 @@ pub fn liquidate_position<'a>(
             AccountMeta::new_readonly(*vault_config.key, false),
             AccountMeta::new(*user_account.key, false),
             AccountMeta::new_readonly(*caller_program.key, false),
+            AccountMeta::new(*vault_token_account.key, false),
+            AccountMeta::new(*insurance_fund_vault.key, false),
+            AccountMeta::new_readonly(*token_program.key, false),
         ],
         data: VaultInstruction::LiquidatePosition {
             margin,
             user_remainder,
+            liquidation_penalty,
         }
         .try_to_vec()?,
     };
 
     invoke_signed(
         &instruction,
-        &[vault_config, user_account, caller_program],
+        &[
+            vault_config,
+            user_account,
+            caller_program,
+            vault_token_account,
+            insurance_fund_vault,
+            token_program,
+        ],
         signers_seeds,
     )
 }

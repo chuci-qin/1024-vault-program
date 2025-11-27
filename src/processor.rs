@@ -122,9 +122,10 @@ impl Processor {
             VaultInstruction::LiquidatePosition {
                 margin,
                 user_remainder,
+                liquidation_penalty,
             } => {
                 msg!("Instruction: LiquidatePosition");
-                Self::process_liquidate_position(accounts, margin, user_remainder)
+                Self::process_liquidate_position(program_id, accounts, margin, user_remainder, liquidation_penalty)
             }
             VaultInstruction::AddAuthorizedCaller { caller } => {
                 msg!("Instruction: AddAuthorizedCaller");
@@ -497,21 +498,30 @@ impl Processor {
         Ok(())
     }
 
-    /// 处理清算 (CPI only) - 仅处理用户账户部分
+    /// 处理清算 (CPI only)
     /// 
-    /// 注意: 清算罚金归保险基金、穿仓覆盖等操作由 Ledger Program 
-    /// 单独通过 CPI 调用 Fund Program 处理
+    /// 执行清算时的完整资金处理:
+    /// 1. 清空用户锁定保证金
+    /// 2. 返还剩余给用户
+    /// 3. 将清算罚金从 Vault Token Account 转入 Insurance Fund Vault
     fn process_liquidate_position(
+        program_id: &Pubkey,
         accounts: &[AccountInfo],
         _margin: u64,
         user_remainder: u64,
+        liquidation_penalty: u64,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
         let caller_program = next_account_info(account_info_iter)?;
+        let vault_token_account = next_account_info(account_info_iter)?;
+        let insurance_fund_vault = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
 
         assert_writable(user_account_info)?;
+        assert_writable(vault_token_account)?;
+        assert_writable(insurance_fund_vault)?;
 
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
         verify_cpi_caller(&vault_config, caller_program)?;
@@ -523,13 +533,62 @@ impl Processor {
         
         // 2. 返还剩余给用户 (如果有)
         if user_remainder > 0 {
-        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, user_remainder as i64)?;
+            user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, user_remainder as i64)?;
         }
 
         user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
-        msg!("Liquidated user account: remainder={}", user_remainder);
+        // 3. 将清算罚金从 Vault Token Account 转入 Insurance Fund Vault
+        if liquidation_penalty > 0 {
+            // 验证 vault_token_account 是 VaultConfig 中配置的
+            if vault_config.vault_token_account != *vault_token_account.key {
+                msg!("❌ Invalid vault token account");
+                return Err(VaultError::InvalidAccount.into());
+            }
+            
+            // 使用 VaultConfig PDA 作为 authority 签名
+            let (vault_config_pda, bump) = Pubkey::find_program_address(
+                &[b"vault_config"],
+                program_id,
+            );
+            
+            if vault_config_pda != *vault_config_info.key {
+                msg!("❌ VaultConfig PDA mismatch");
+                return Err(VaultError::InvalidAccount.into());
+            }
+            
+            let transfer_ix = spl_token::instruction::transfer(
+                &spl_token::id(),
+                vault_token_account.key,
+                insurance_fund_vault.key,
+                vault_config_info.key, // VaultConfig PDA is the authority
+                &[],
+                liquidation_penalty,
+            )?;
+            
+            invoke_signed(
+                &transfer_ix,
+                &[
+                    vault_token_account.clone(),
+                    insurance_fund_vault.clone(),
+                    vault_config_info.clone(),
+                    token_program.clone(),
+                ],
+                &[&[b"vault_config", &[bump]]],
+            )?;
+            
+            msg!(
+                "✅ Liquidation penalty {} transferred to Insurance Fund",
+                liquidation_penalty
+            );
+        }
+
+        msg!(
+            "Liquidated user account: remainder={}, penalty={}",
+            user_remainder,
+            liquidation_penalty
+        );
         Ok(())
     }
 

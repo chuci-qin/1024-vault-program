@@ -103,20 +103,27 @@ pub enum VaultInstruction {
         fee: u64,
     },
 
-    /// 清算用户账户部分 (CPI only)
+    /// 清算用户账户 (CPI only)
     /// 
-    /// 注意: 清算罚金/穿仓由 Ledger Program 单独通过 CPI 调用 Fund Program
-    /// 此指令仅处理用户账户的余额更新
+    /// 执行清算时的资金处理:
+    /// 1. 清空用户锁定保证金
+    /// 2. 返还剩余给用户
+    /// 3. 将清算罚金转入 Insurance Fund (实际 Token Transfer)
     /// 
     /// Accounts:
     /// 0. `[]` VaultConfig
     /// 1. `[writable]` UserAccount
     /// 2. `[]` Caller Program
+    /// 3. `[writable]` Vault Token Account (源账户)
+    /// 4. `[writable]` Insurance Fund Vault (目标账户 - Fund Program)
+    /// 5. `[]` Token Program
     LiquidatePosition {
         /// 用户锁定的保证金 (e6) - 将被清空
         margin: u64,
         /// 返还给用户的剩余 (e6)
         user_remainder: u64,
+        /// 清算罚金 (e6) - 转入 Insurance Fund
+        liquidation_penalty: u64,
     },
 
     /// 添加授权调用方 (Admin only)
