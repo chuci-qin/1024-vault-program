@@ -175,4 +175,109 @@ pub enum VaultInstruction {
         /// Fund Program ID
         fund_program: Pubkey,
     },
+
+    /// Admin 强制释放用户锁定保证金 (Admin only)
+    /// 
+    /// 用于处理用户没有任何持仓但 locked_margin 残留的异常情况
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` VaultConfig
+    AdminForceReleaseMargin {
+        /// 要释放的金额 (e6)，如果为 0 则释放全部 locked_margin
+        amount: u64,
+    },
+    
+    // =========================================================================
+    // Prediction Market 预测市场相关指令 - 使用独立的 PredictionMarketUserAccount PDA
+    // =========================================================================
+
+    /// 初始化预测市场用户账户
+    /// 
+    /// 创建独立的 PredictionMarketUserAccount PDA，不修改现有 UserAccount
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[writable]` PredictionMarketUserAccount PDA
+    /// 2. `[]` System Program
+    InitializePredictionMarketUser,
+
+    /// 预测市场锁定 USDC (CPI only - 由 Prediction Market Program 调用)
+    /// 
+    /// 流程:
+    /// 1. 从 UserAccount.available_balance 扣除金额
+    /// 2. 增加 PredictionMarketUserAccount.prediction_market_locked
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount (扣除 available_balance)
+    /// 2. `[writable]` PredictionMarketUserAccount (增加 prediction_market_locked)
+    /// 3. `[]` Caller Program (验证白名单)
+    PredictionMarketLock {
+        /// 锁定金额 (e6)
+        amount: u64,
+    },
+
+    /// 预测市场释放锁定 (CPI only)
+    /// 
+    /// 用户卖出 YES/NO Token 或赎回完整集时
+    /// 
+    /// 流程:
+    /// 1. 从 PredictionMarketUserAccount.prediction_market_locked 扣除
+    /// 2. 增加 UserAccount.available_balance
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount
+    /// 2. `[writable]` PredictionMarketUserAccount
+    /// 3. `[]` Caller Program (验证白名单)
+    PredictionMarketUnlock {
+        /// 释放金额 (e6)
+        amount: u64,
+    },
+
+    /// 预测市场结算 (CPI only)
+    /// 
+    /// 市场结算后，释放锁定并记录应得的结算金额
+    /// 
+    /// 流程:
+    /// 1. 从 PredictionMarketUserAccount.prediction_market_locked 扣除 locked_amount
+    /// 2. 将 settlement_amount 记入 PredictionMarketUserAccount.prediction_market_pending_settlement
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` PredictionMarketUserAccount
+    /// 2. `[]` Caller Program
+    PredictionMarketSettle {
+        /// 用户原锁定金额 (e6)
+        locked_amount: u64,
+        /// 结算应得金额 (e6)
+        settlement_amount: u64,
+    },
+
+    /// 预测市场领取结算收益
+    /// 
+    /// 用户主动调用，将 prediction_market_pending_settlement 转为 UserAccount.available_balance
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[writable]` UserAccount
+    /// 2. `[writable]` PredictionMarketUserAccount
+    PredictionMarketClaimSettlement,
+
+    /// Admin 强制释放预测市场锁定 (Admin only)
+    /// 
+    /// 用于处理异常情况（如市场取消后用户未操作）
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[writable]` UserAccount
+    /// 2. `[writable]` PredictionMarketUserAccount
+    /// 3. `[]` VaultConfig
+    AdminPredictionMarketForceUnlock {
+        /// 要释放的金额 (e6)，如果为 0 则释放全部
+        amount: u64,
+    },
 }
+

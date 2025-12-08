@@ -147,6 +147,10 @@ impl Processor {
                 msg!("Instruction: SetFundProgram");
                 Self::process_set_fund_program(accounts, fund_program)
             }
+            VaultInstruction::AdminForceReleaseMargin { amount } => {
+                msg!("Instruction: AdminForceReleaseMargin");
+                Self::process_admin_force_release_margin(accounts, amount)
+            }
         }
     }
 
@@ -698,6 +702,62 @@ impl Processor {
         vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
 
         msg!("Fund program set to: {}", fund_program);
+        Ok(())
+    }
+
+    /// Admin 强制释放用户锁定保证金
+    /// 
+    /// 用于处理用户没有任何持仓但 locked_margin 残留的异常情况
+    fn process_admin_force_release_margin(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        // 验证 admin 签名
+        assert_signer(admin)?;
+        assert_writable(user_account_info)?;
+
+        // 验证 admin 权限
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::InvalidAdmin.into());
+        }
+
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        
+        // 计算要释放的金额
+        let release_amount = if amount == 0 {
+            // 释放全部 locked_margin
+            user_account.locked_margin_e6
+        } else {
+            amount as i64
+        };
+
+        // 验证释放金额不超过 locked_margin
+        if release_amount > user_account.locked_margin_e6 {
+            return Err(VaultError::InsufficientMargin.into());
+        }
+
+        if release_amount <= 0 {
+            msg!("No locked margin to release");
+            return Ok(());
+        }
+
+        // 释放保证金：locked -> available
+        user_account.locked_margin_e6 = checked_sub(user_account.locked_margin_e6, release_amount)?;
+        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, release_amount)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!(
+            "Admin force released {} e6 locked margin for user {}. New locked: {}, available: {}",
+            release_amount,
+            user_account.wallet,
+            user_account.locked_margin_e6,
+            user_account.available_balance_e6
+        );
+        
         Ok(())
     }
 }
