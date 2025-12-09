@@ -64,6 +64,10 @@ pub enum VaultError {
     /// CPI caller is not a signer
     #[error("CPI caller must be a signer")]
     CallerNotSigner,
+
+    /// Invalid relayer (not admin or authorized relayer)
+    #[error("Invalid relayer")]
+    InvalidRelayer,
 }
 
 impl From<VaultError> for ProgramError {

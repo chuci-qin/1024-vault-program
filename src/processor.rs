@@ -151,6 +151,42 @@ impl Processor {
                 msg!("Instruction: AdminForceReleaseMargin");
                 Self::process_admin_force_release_margin(accounts, amount)
             }
+            
+            // Prediction Market 指令
+            VaultInstruction::InitializePredictionMarketUser => {
+                msg!("Instruction: InitializePredictionMarketUser");
+                Self::process_initialize_prediction_market_user(program_id, accounts)
+            }
+            VaultInstruction::PredictionMarketLock { amount } => {
+                msg!("Instruction: PredictionMarketLock");
+                Self::process_prediction_market_lock(accounts, amount)
+            }
+            VaultInstruction::PredictionMarketUnlock { amount } => {
+                msg!("Instruction: PredictionMarketUnlock");
+                Self::process_prediction_market_unlock(accounts, amount)
+            }
+            VaultInstruction::PredictionMarketSettle { locked_amount, settlement_amount } => {
+                msg!("Instruction: PredictionMarketSettle");
+                Self::process_prediction_market_settle(accounts, locked_amount, settlement_amount)
+            }
+            VaultInstruction::PredictionMarketClaimSettlement => {
+                msg!("Instruction: PredictionMarketClaimSettlement");
+                Self::process_prediction_market_claim_settlement(accounts)
+            }
+            VaultInstruction::AdminPredictionMarketForceUnlock { amount } => {
+                msg!("Instruction: AdminPredictionMarketForceUnlock");
+                Self::process_admin_prediction_market_force_unlock(accounts, amount)
+            }
+            
+            // Relayer 指令
+            VaultInstruction::RelayerDeposit { user_wallet, amount } => {
+                msg!("Instruction: RelayerDeposit");
+                Self::process_relayer_deposit(program_id, accounts, user_wallet, amount)
+            }
+            VaultInstruction::RelayerWithdraw { user_wallet, amount } => {
+                msg!("Instruction: RelayerWithdraw");
+                Self::process_relayer_withdraw(program_id, accounts, user_wallet, amount)
+            }
         }
     }
 
@@ -757,6 +793,455 @@ impl Processor {
             user_account.locked_margin_e6,
             user_account.available_balance_e6
         );
+        
+        Ok(())
+    }
+
+    // =========================================================================
+    // Prediction Market 指令实现
+    // =========================================================================
+
+    /// 初始化预测市场用户账户
+    fn process_initialize_prediction_market_user(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let user = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        let _system_program = next_account_info(account_info_iter)?;
+
+        assert_signer(user)?;
+
+        let (pm_user_pda, bump) = Pubkey::find_program_address(
+            &[PREDICTION_MARKET_USER_SEED, user.key.as_ref()],
+            program_id
+        );
+
+        if pm_user_account_info.key != &pm_user_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        let rent = Rent::get()?;
+        let space = PREDICTION_MARKET_USER_ACCOUNT_SIZE;
+        let lamports = rent.minimum_balance(space);
+
+        invoke_signed(
+            &system_instruction::create_account(
+                user.key,
+                pm_user_account_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[user.clone(), pm_user_account_info.clone()],
+            &[&[PREDICTION_MARKET_USER_SEED, user.key.as_ref(), &[bump]]],
+        )?;
+
+        let pm_user_account = PredictionMarketUserAccount::new(
+            *user.key,
+            bump,
+            solana_program::clock::Clock::get()?.unix_timestamp,
+        );
+        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("Prediction market user account initialized for {}", user.key);
+        Ok(())
+    }
+
+    /// 预测市场锁定 (CPI only)
+    fn process_prediction_market_lock(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        assert_writable(user_account_info)?;
+        assert_writable(pm_user_account_info)?;
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        // 从 UserAccount 扣除
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        if user_account.available_balance_e6 < amount as i64 {
+            return Err(VaultError::InsufficientBalance.into());
+        }
+        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        // 增加 PredictionMarketUserAccount
+        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
+        pm_user_account.prediction_market_lock(amount as i64, solana_program::clock::Clock::get()?.unix_timestamp);
+        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("Prediction market locked {} e6 for {}", amount, user_account.wallet);
+        Ok(())
+    }
+
+    /// 预测市场释放锁定 (CPI only)
+    fn process_prediction_market_unlock(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        assert_writable(user_account_info)?;
+        assert_writable(pm_user_account_info)?;
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        // 从 PredictionMarketUserAccount 扣除
+        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
+        pm_user_account.prediction_market_unlock(amount as i64, solana_program::clock::Clock::get()?.unix_timestamp)
+            .map_err(|_| VaultError::InsufficientMargin)?;
+        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+
+        // 增加 UserAccount
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, amount as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("Prediction market unlocked {} e6 for {}", amount, user_account.wallet);
+        Ok(())
+    }
+
+    /// 预测市场结算 (CPI only)
+    fn process_prediction_market_settle(
+        accounts: &[AccountInfo],
+        locked_amount: u64,
+        settlement_amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        assert_writable(pm_user_account_info)?;
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
+        pm_user_account.prediction_market_settle(
+            locked_amount as i64,
+            settlement_amount as i64,
+            solana_program::clock::Clock::get()?.unix_timestamp,
+        ).map_err(|_| VaultError::InsufficientMargin)?;
+        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("Prediction market settled: locked={}, settlement={}", locked_amount, settlement_amount);
+        Ok(())
+    }
+
+    /// 预测市场领取结算收益
+    fn process_prediction_market_claim_settlement(accounts: &[AccountInfo]) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let user = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+
+        assert_signer(user)?;
+        assert_writable(user_account_info)?;
+        assert_writable(pm_user_account_info)?;
+
+        // 从 PredictionMarketUserAccount 领取
+        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
+        if pm_user_account.wallet != *user.key {
+            return Err(VaultError::InvalidAccount.into());
+        }
+        let claim_amount = pm_user_account.prediction_market_claim_settlement(
+            solana_program::clock::Clock::get()?.unix_timestamp
+        );
+        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+
+        if claim_amount <= 0 {
+            msg!("No pending settlement to claim");
+            return Ok(());
+        }
+
+        // 增加到 UserAccount
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        if user_account.wallet != *user.key {
+            return Err(VaultError::InvalidAccount.into());
+        }
+        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, claim_amount)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("Claimed prediction market settlement: {} e6", claim_amount);
+        Ok(())
+    }
+
+    /// Admin 强制释放预测市场锁定
+    fn process_admin_prediction_market_force_unlock(
+        accounts: &[AccountInfo],
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+        assert_writable(user_account_info)?;
+        assert_writable(pm_user_account_info)?;
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::InvalidAdmin.into());
+        }
+
+        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
+        let release_amount = if amount == 0 {
+            pm_user_account.prediction_market_locked_e6
+        } else {
+            amount as i64
+        };
+
+        if release_amount <= 0 {
+            msg!("No locked amount to release");
+            return Ok(());
+        }
+
+        if pm_user_account.prediction_market_locked_e6 < release_amount {
+            return Err(VaultError::InsufficientMargin.into());
+        }
+
+        pm_user_account.prediction_market_locked_e6 -= release_amount;
+        pm_user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, release_amount)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("Admin force unlocked {} e6 from prediction market for {}", release_amount, user_account.wallet);
+        Ok(())
+    }
+
+    // =========================================================================
+    // Relayer 指令实现
+    // =========================================================================
+
+    /// Relayer 代理入金
+    /// 
+    /// 功能：
+    /// 1. 验证 Admin 签名
+    /// 2. 如果 UserAccount 不存在，自动创建
+    /// 3. 增加用户余额
+    /// 
+    /// 测试网特性：Admin 可自由给任何用户入金（凭证模式）
+    fn process_relayer_deposit(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        // 1. 验证 admin 签名和账户可写
+        assert_signer(admin)?;
+        assert_writable(user_account_info)?;
+        // VaultConfig 不需要写入 (不更新 total_deposits)
+
+        // 2. 验证 admin 权限
+        // 兼容旧版 VaultConfig：直接读取 admin 字段 (offset 8, 32 bytes)
+        let vault_config_data = vault_config_info.data.borrow();
+        if vault_config_data.len() < 40 {
+            msg!("❌ Invalid VaultConfig data length: {}", vault_config_data.len());
+            return Err(VaultError::InvalidAccount.into());
+        }
+        
+        // VaultConfig 结构: discriminator (8) + admin (32) + ...
+        let stored_admin = Pubkey::try_from(&vault_config_data[8..40])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        
+        if stored_admin != *admin.key {
+            msg!("❌ Invalid relayer: {} (expected admin: {})", admin.key, stored_admin);
+            return Err(VaultError::InvalidRelayer.into());
+        }
+        
+        // 跳过 is_paused 检查 (兼容旧版结构)
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        // 3. 验证 UserAccount PDA
+        let (user_account_pda, bump) = Pubkey::find_program_address(
+            &[b"user", user_wallet.as_ref()],
+            program_id
+        );
+        if user_account_info.key != &user_account_pda {
+            msg!("❌ Invalid UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 4. 检查 UserAccount 是否存在，不存在则创建
+        if user_account_info.data_is_empty() {
+            msg!("Creating new UserAccount for {}", user_wallet);
+            
+            let rent = Rent::get()?;
+            let space = USER_ACCOUNT_SIZE;
+            let lamports = rent.minimum_balance(space);
+
+            invoke_signed(
+                &system_instruction::create_account(
+                    admin.key,
+                    user_account_info.key,
+                    lamports,
+                    space as u64,
+                    program_id,
+                ),
+                &[admin.clone(), user_account_info.clone(), system_program.clone()],
+                &[&[b"user", user_wallet.as_ref(), &[bump]]],
+            )?;
+
+            // 初始化新账户
+            let user_account = UserAccount {
+                discriminator: UserAccount::DISCRIMINATOR,
+                wallet: user_wallet,
+                bump,
+                available_balance_e6: amount as i64,
+                locked_margin_e6: 0,
+                unrealized_pnl_e6: 0,
+                total_deposited_e6: amount as i64,
+                total_withdrawn_e6: 0,
+                last_update_ts: solana_program::clock::Clock::get()?.unix_timestamp,
+                reserved: [0; 64],
+            };
+            user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+            msg!("✅ Created UserAccount and deposited {} e6 for {}", amount, user_wallet);
+        } else {
+            // 5. 更新现有 UserAccount
+            let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+            
+            // 验证钱包地址匹配
+            if user_account.wallet != user_wallet {
+                msg!("❌ Wallet mismatch: expected {}, got {}", user_wallet, user_account.wallet);
+                return Err(VaultError::InvalidAccount.into());
+            }
+
+            user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, amount as i64)?;
+            user_account.total_deposited_e6 = checked_add(user_account.total_deposited_e6, amount as i64)?;
+            user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+            user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+            msg!("✅ RelayerDeposit {} e6 for {} (total: {})", 
+                amount, user_wallet, user_account.available_balance_e6);
+        }
+
+        // 注意: 跳过更新 VaultConfig.total_deposits (兼容旧版结构)
+        // 这是测试网的简化实现
+
+        Ok(())
+    }
+
+    /// Relayer 代理出金
+    /// 
+    /// 功能：
+    /// 1. 验证 Admin 签名
+    /// 2. 验证用户余额充足
+    /// 3. 扣除用户余额
+    /// 
+    /// 注意：Relayer 负责在 Solana 主网/Arbitrum 给用户转账
+    fn process_relayer_withdraw(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        // 1. 验证 admin 签名和账户可写
+        assert_signer(admin)?;
+        assert_writable(user_account_info)?;
+
+        // 2. 验证 admin 权限
+        // 兼容旧版 VaultConfig：直接读取 admin 字段 (offset 8, 32 bytes)
+        let vault_config_data = vault_config_info.data.borrow();
+        if vault_config_data.len() < 40 {
+            msg!("❌ Invalid VaultConfig data length: {}", vault_config_data.len());
+            return Err(VaultError::InvalidAccount.into());
+        }
+        
+        // VaultConfig 结构: discriminator (8) + admin (32) + ...
+        let stored_admin = Pubkey::try_from(&vault_config_data[8..40])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        
+        if stored_admin != *admin.key {
+            msg!("❌ Invalid relayer: {} (expected admin: {})", admin.key, stored_admin);
+            return Err(VaultError::InvalidRelayer.into());
+        }
+        
+        // 跳过 is_paused 检查 (兼容旧版结构)
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        // 3. 验证 UserAccount PDA
+        let (user_account_pda, _bump) = Pubkey::find_program_address(
+            &[b"user", user_wallet.as_ref()],
+            program_id
+        );
+        if user_account_info.key != &user_account_pda {
+            msg!("❌ Invalid UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 4. 验证账户存在
+        if user_account_info.data_is_empty() {
+            msg!("❌ UserAccount does not exist for {}", user_wallet);
+            return Err(VaultError::NotInitialized.into());
+        }
+
+        // 5. 扣除用户余额
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        
+        // 验证钱包地址匹配
+        if user_account.wallet != user_wallet {
+            msg!("❌ Wallet mismatch: expected {}, got {}", user_wallet, user_account.wallet);
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        // 验证余额充足
+        if user_account.available_balance_e6 < amount as i64 {
+            msg!("❌ Insufficient balance: {} < {}", user_account.available_balance_e6, amount);
+            return Err(VaultError::InsufficientBalance.into());
+        }
+
+        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
+        user_account.total_withdrawn_e6 = checked_add(user_account.total_withdrawn_e6, amount as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ RelayerWithdraw {} e6 for {} (remaining: {})", 
+            amount, user_wallet, user_account.available_balance_e6);
         
         Ok(())
     }

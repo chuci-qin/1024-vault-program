@@ -279,5 +279,52 @@ pub enum VaultInstruction {
         /// 要释放的金额 (e6)，如果为 0 则释放全部
         amount: u64,
     },
+
+    // =========================================================================
+    // Relayer 指令 - 用于跨链入金/出金
+    // =========================================================================
+
+    /// Relayer 代理入金 (Admin/Relayer only)
+    /// 
+    /// 用途：当用户在 Solana 主网/Arbitrum 等链转账后，
+    /// 由授权的 Relayer 代替用户在 1024Chain 上入金到 Vault
+    /// 
+    /// 特性：
+    /// - 如果用户 UserAccount 不存在，会自动创建
+    /// - 仅 Admin 可调用 (测试网自由入金)
+    /// - 不涉及实际 Token Transfer（余额凭证模式）
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA (会自动创建)
+    /// 2. `[writable]` VaultConfig
+    /// 3. `[]` System Program (用于创建账户)
+    RelayerDeposit {
+        /// 目标用户钱包地址
+        user_wallet: Pubkey,
+        /// 入金金额 (e6)
+        amount: u64,
+    },
+
+    /// Relayer 代理出金 (Admin/Relayer only)
+    /// 
+    /// 用途：用户请求出金后，Relayer 在 1024Chain 上扣除余额，
+    /// 然后在 Solana 主网/Arbitrum 等链上给用户转账
+    /// 
+    /// 安全性：
+    /// - 仅 Admin 可调用
+    /// - 必须验证用户有足够余额
+    /// - 出金后 Relayer 负责在对应链完成转账
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` VaultConfig
+    RelayerWithdraw {
+        /// 目标用户钱包地址
+        user_wallet: Pubkey,
+        /// 出金金额 (e6)
+        amount: u64,
+    },
 }
 
