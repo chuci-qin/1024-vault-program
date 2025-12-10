@@ -12,19 +12,26 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::pubkey::Pubkey;
 
 /// VaultConfig 账户大小 (bytes)
-/// 注意: Vec 和 Option 在 Borsh 中有额外的长度前缀
+/// 
+/// ⚠️ 重要：此结构必须与链上已部署的账户数据格式完全匹配！
+/// 链上账户大小: 569 bytes
+///
+/// 修复记录 (2025-12-10):
+/// - authorized_callers 从 Vec<Pubkey> 改为 [Pubkey; 10] 固定大小数组
+/// - fund_program 从 Option<Pubkey> 改为 Pubkey
 pub const VAULT_CONFIG_SIZE: usize = 8 + // discriminator
     32 + // admin
     32 + // usdc_mint
     32 + // vault_token_account
-    4 + (32 * 10) + // authorized_callers (Vec<Pubkey>: 4字节长度 + 最多10个Pubkey)
+    32 * 10 + // authorized_callers ([Pubkey; 10])
     32 + // ledger_program
-    1 + 32 + // fund_program (Option<Pubkey>: 1字节tag + 32字节)
+    32 + // fund_program (Pubkey，不是 Option)
     32 + // delegation_program
     8 + // total_deposits
     8 + // total_locked
     1 + // is_paused
-    64; // 预留空间
+    32; // 预留空间
+// Total: 8 + 32 + 32 + 32 + 320 + 32 + 32 + 32 + 8 + 8 + 1 + 32 = 569 bytes ✓
 
 /// UserAccount 账户大小 (bytes)
 pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
@@ -39,50 +46,75 @@ pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
     64; // reserved
 
 /// Vault 全局配置
+/// 
+/// ⚠️ 重要：此结构必须与链上已部署的账户数据格式完全匹配！
+/// 链上账户大小: 569 bytes
+///
+/// 修复记录 (2025-12-10):
+/// - authorized_callers 从 Vec<Pubkey> 改为 [Pubkey; 10] 固定大小数组
+/// - fund_program 从 Option<Pubkey> 改为 Pubkey
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct VaultConfig {
-    /// 账户类型标识符
+    /// 账户类型标识符 (8 bytes)
     pub discriminator: u64,
     
-    /// 管理员
+    /// 管理员 (32 bytes)
     pub admin: Pubkey,
     
-    /// USDC Mint 地址
+    /// USDC Mint 地址 (32 bytes)
     pub usdc_mint: Pubkey,
     
-    /// Vault Token Account (存放所有用户的USDC)
+    /// Vault Token Account (存放所有用户的USDC) (32 bytes)
     pub vault_token_account: Pubkey,
     
-    /// 授权调用 CPI 的 Program 列表
-    pub authorized_callers: Vec<Pubkey>,
+    /// 授权调用 CPI 的 Program 列表 (320 bytes = 32 * 10)
+    /// ⚠️ 固定大小数组，不是 Vec！
+    pub authorized_callers: [Pubkey; 10],
     
-    /// Ledger Program ID
+    /// Ledger Program ID (32 bytes)
     pub ledger_program: Pubkey,
     
-    /// Fund Program ID (用于清算罚金转入等 CPI)
-    pub fund_program: Option<Pubkey>,
+    /// Fund Program ID (32 bytes)
+    /// ⚠️ 不是 Option<Pubkey>，链上是直接的 Pubkey
+    pub fund_program: Pubkey,
     
-    /// Delegation Program ID
+    /// Delegation Program ID (32 bytes)
     pub delegation_program: Pubkey,
     
-    /// 总存款 (e6)
+    /// 总存款 (e6) (8 bytes)
     pub total_deposits: u64,
     
-    /// 总锁定保证金 (e6)
+    /// 总锁定保证金 (e6) (8 bytes)
     pub total_locked: u64,
     
-    /// 是否暂停
+    /// 是否暂停 (1 byte)
     pub is_paused: bool,
+    
+    /// 预留空间 (32 bytes)
+    pub reserved: [u8; 32],
 }
+// Total: 8 + 32 + 32 + 32 + 320 + 32 + 32 + 32 + 8 + 8 + 1 + 32 = 569 bytes ✓
 
 impl VaultConfig {
     pub const DISCRIMINATOR: u64 = 0x5641554C545F434F; // "VAULT_CO"
     
     /// 验证调用方是否授权
     pub fn is_authorized_caller(&self, caller: &Pubkey) -> bool {
-        caller == &self.ledger_program 
-            || self.fund_program.as_ref() == Some(caller)
-            || self.authorized_callers.contains(caller)
+        // Check ledger_program
+        if caller == &self.ledger_program {
+            return true;
+        }
+        // Check fund_program (non-zero check)
+        if self.fund_program != Pubkey::default() && caller == &self.fund_program {
+            return true;
+        }
+        // Check authorized_callers array (skip zero pubkeys)
+        for authorized in &self.authorized_callers {
+            if authorized != &Pubkey::default() && caller == authorized {
+                return true;
+            }
+        }
+        false
     }
 }
 

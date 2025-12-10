@@ -175,6 +175,16 @@ pub enum VaultInstruction {
         /// Fund Program ID
         fund_program: Pubkey,
     },
+    
+    /// 设置 Ledger Program (Admin only)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[writable]` VaultConfig
+    SetLedgerProgram {
+        /// Ledger Program ID
+        ledger_program: Pubkey,
+    },
 
     /// Admin 强制释放用户锁定保证金 (Admin only)
     /// 

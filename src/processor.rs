@@ -52,9 +52,9 @@ fn verify_cpi_caller(
         msg!("✅ CPI caller verified as ledger_config PDA");
     } else if caller_program.key == &vault_config.ledger_program {
         msg!("✅ CPI caller is ledger_program");
-    } else if vault_config.authorized_callers.contains(caller_program.key) {
+    } else if vault_config.authorized_callers.iter().any(|pk| pk == caller_program.key && *pk != Pubkey::default()) {
         msg!("✅ CPI caller in authorized list");
-    } else if vault_config.fund_program.as_ref() == Some(caller_program.key) {
+    } else if vault_config.fund_program != Pubkey::default() && caller_program.key == &vault_config.fund_program {
         msg!("✅ CPI caller is fund_program");
     } else {
         msg!("❌ Unknown CPI caller: {}", caller_program.key);
@@ -146,6 +146,10 @@ impl Processor {
             VaultInstruction::SetFundProgram { fund_program } => {
                 msg!("Instruction: SetFundProgram");
                 Self::process_set_fund_program(accounts, fund_program)
+            }
+            VaultInstruction::SetLedgerProgram { ledger_program } => {
+                msg!("Instruction: SetLedgerProgram");
+                Self::process_set_ledger_program(accounts, ledger_program)
             }
             VaultInstruction::AdminForceReleaseMargin { amount } => {
                 msg!("Instruction: AdminForceReleaseMargin");
@@ -239,13 +243,14 @@ impl Processor {
             admin: *admin.key,
             usdc_mint: *usdc_mint.key,
             vault_token_account: *vault_token_account.key,
-            authorized_callers: Vec::new(),
+            authorized_callers: [Pubkey::default(); 10], // 固定大小数组
             ledger_program,
-            fund_program: Some(fund_program),
+            fund_program, // 不再是 Option
             delegation_program,
             total_deposits: 0,
             total_locked: 0,
             is_paused: false,
+            reserved: [0u8; 32],
         };
 
         vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
@@ -646,12 +651,29 @@ impl Processor {
             return Err(VaultError::InvalidAdmin.into());
         }
 
-        if !vault_config.authorized_callers.contains(&caller) {
-            vault_config.authorized_callers.push(caller);
+        // 检查是否已存在
+        let already_exists = vault_config.authorized_callers.iter().any(|pk| *pk == caller);
+        if already_exists {
+            msg!("Caller already authorized: {}", caller);
+            return Ok(());
+        }
+
+        // 找到一个空槽位并添加
+        let mut added = false;
+        for slot in vault_config.authorized_callers.iter_mut() {
+            if *slot == Pubkey::default() {
+                *slot = caller;
+                added = true;
+                break;
+            }
+        }
+
+        if added {
             vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
             msg!("Added authorized caller: {}", caller);
         } else {
-            msg!("Caller already authorized: {}", caller);
+            msg!("❌ No empty slot available for authorized caller");
+            return Err(VaultError::InvalidAccount.into());
         }
 
         Ok(())
@@ -671,10 +693,23 @@ impl Processor {
             return Err(VaultError::InvalidAdmin.into());
         }
 
-        vault_config.authorized_callers.retain(|&x| x != caller);
-        vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
+        // 找到并移除 caller (设为默认值)
+        let mut removed = false;
+        for slot in vault_config.authorized_callers.iter_mut() {
+            if *slot == caller {
+                *slot = Pubkey::default();
+                removed = true;
+                break;
+            }
+        }
 
-        msg!("Removed authorized caller: {}", caller);
+        if removed {
+            vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
+            msg!("Removed authorized caller: {}", caller);
+        } else {
+            msg!("Caller not found in authorized list: {}", caller);
+        }
+
         Ok(())
     }
 
@@ -734,10 +769,31 @@ impl Processor {
             return Err(VaultError::InvalidAdmin.into());
         }
 
-        vault_config.fund_program = Some(fund_program);
+        vault_config.fund_program = fund_program;
         vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
 
         msg!("Fund program set to: {}", fund_program);
+        Ok(())
+    }
+    
+    fn process_set_ledger_program(accounts: &[AccountInfo], ledger_program: Pubkey) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+        assert_writable(vault_config_info)?;
+
+        let mut vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::InvalidAdmin.into());
+        }
+
+        vault_config.ledger_program = ledger_program;
+        vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
+
+        msg!("Ledger program set to: {}", ledger_program);
         Ok(())
     }
 
