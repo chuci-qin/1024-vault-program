@@ -187,6 +187,10 @@ impl Processor {
                 msg!("Instruction: RelayerWithdraw");
                 Self::process_relayer_withdraw(program_id, accounts, user_wallet, amount)
             }
+            VaultInstruction::RelayerWithdrawAndTransfer { user_wallet, amount } => {
+                msg!("Instruction: RelayerWithdrawAndTransfer");
+                Self::process_relayer_withdraw_and_transfer(program_id, accounts, user_wallet, amount)
+            }
         }
     }
 
@@ -1241,6 +1245,118 @@ impl Processor {
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
         msg!("✅ RelayerWithdraw {} e6 for {} (remaining: {})", 
+            amount, user_wallet, user_account.available_balance_e6);
+        
+        Ok(())
+    }
+    
+    /// Relayer 代理出金并转账（用于跨链）
+    /// 
+    /// 功能：
+    /// 1. 验证 Admin 签名
+    /// 2. 验证用户余额充足
+    /// 3. 扣除用户余额
+    /// 4. 从 Vault Token Account 转 USDC 到 Relayer
+    /// 
+    /// 用途：Relayer 收到 USDC 后可以调用 Bridge.stake 发起跨链
+    fn process_relayer_withdraw_and_transfer(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let vault_token_account = next_account_info(account_info_iter)?;
+        let relayer_token_account = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+
+        // 1. 验证 admin 签名
+        assert_signer(admin)?;
+        assert_writable(user_account_info)?;
+        assert_writable(vault_token_account)?;
+        assert_writable(relayer_token_account)?;
+
+        // 2. 验证 admin 权限（兼容旧版 VaultConfig）
+        let vault_config_data = vault_config_info.data.borrow();
+        if vault_config_data.len() < 40 {
+            return Err(VaultError::InvalidAccount.into());
+        }
+        
+        let config_admin = Pubkey::new(&vault_config_data[8..40]);
+        if admin.key != &config_admin {
+            msg!("❌ Admin verification failed: {} != {}", admin.key, config_admin);
+            return Err(VaultError::InvalidAdmin.into());
+        }
+
+        // 3. 验证 UserAccount PDA
+        let (expected_pda, _bump) = Pubkey::find_program_address(
+            &[b"user", user_wallet.as_ref()],
+            program_id
+        );
+        if user_account_info.key != &expected_pda {
+            msg!("❌ Invalid UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 4. 验证金额
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        // 5. 扣除用户余额
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        
+        if user_account.wallet != user_wallet {
+            msg!("❌ Wallet mismatch");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        if user_account.available_balance_e6 < amount as i64 {
+            msg!("❌ Insufficient balance: {} < {}", user_account.available_balance_e6, amount);
+            return Err(VaultError::InsufficientBalance.into());
+        }
+
+        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
+        user_account.total_withdrawn_e6 = checked_add(user_account.total_withdrawn_e6, amount as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        // 6. 从 Vault Token Account 转 USDC 到 Relayer
+        let transfer_ix = spl_token::instruction::transfer(
+            token_program.key,
+            vault_token_account.key,
+            relayer_token_account.key,
+            vault_config_info.key,  // Vault PDA 作为 authority
+            &[],
+            amount,
+        )?;
+
+        // 派生 Vault Token Account PDA 的 authority (VaultConfig)
+        let (vault_config_pda, bump) = Pubkey::find_program_address(
+            &[b"vault_config"],
+            program_id
+        );
+        
+        if vault_config_info.key != &vault_config_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 使用 PDA 签名执行转账
+        invoke_signed(
+            &transfer_ix,
+            &[
+                vault_token_account.clone(),
+                relayer_token_account.clone(),
+                vault_config_info.clone(),
+                token_program.clone(),
+            ],
+            &[&[b"vault_config", &[bump]]],
+        )?;
+
+        msg!("✅ RelayerWithdrawAndTransfer {} e6 for {} → Relayer (remaining: {})", 
             amount, user_wallet, user_account.available_balance_e6);
         
         Ok(())

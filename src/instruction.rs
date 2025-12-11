@@ -326,5 +326,25 @@ pub enum VaultInstruction {
         /// 出金金额 (e6)
         amount: u64,
     },
+    
+    /// Relayer 代理出金并转账（用于跨链桥出金）
+    /// 
+    /// 功能：
+    /// 1. 扣除用户 Vault 余额
+    /// 2. 从 Vault Token Account 转 USDC 到 Relayer
+    /// 
+    /// 用途：Relayer 收到 USDC 后调用 Bridge.stake 发起跨链
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[writable]` VaultConfig
+    /// 3. `[writable]` Vault USDC Token Account
+    /// 4. `[writable]` Relayer USDC Token Account
+    /// 5. `[]` Token Program
+    RelayerWithdrawAndTransfer {
+        user_wallet: Pubkey,
+        amount: u64,
+    },
 }
 
