@@ -521,6 +521,15 @@ impl Processor {
         }
         user_account.locked_margin_e6 = checked_sub(user_account.locked_margin_e6, margin_to_release as i64)?;
         user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, margin_to_release as i64)?;
+        
+        // 🔧 自动清理残留 locked_margin
+        // 当释放后 locked_margin 小于 1 USDC (1_000_000 e6) 时，自动释放全部剩余
+        // 这解决了精度累积误差导致的残留问题
+        if user_account.locked_margin_e6 > 0 && user_account.locked_margin_e6 < 1_000_000 {
+            msg!("🔧 Auto-cleanup: releasing residual locked_margin={}", user_account.locked_margin_e6);
+            user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, user_account.locked_margin_e6)?;
+            user_account.locked_margin_e6 = 0;
+        }
 
         // 2. 结算盈亏
         user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, realized_pnl)?;

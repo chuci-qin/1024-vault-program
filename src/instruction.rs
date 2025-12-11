@@ -175,7 +175,7 @@ pub enum VaultInstruction {
         /// Fund Program ID
         fund_program: Pubkey,
     },
-    
+
     /// 设置 Ledger Program (Admin only)
     /// 
     /// Accounts:
