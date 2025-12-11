@@ -346,5 +346,30 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         amount: u64,
     },
+    
+    /// 从中转账户转账到目标用户（跨链桥入金专用）
+    /// 
+    /// 功能：
+    /// 1. 从中转账户的 Vault 余额扣除
+    /// 2. 增加到目标用户的 Vault 余额
+    /// 3. 如果目标用户账户不存在，自动创建
+    /// 
+    /// 用途：跨链入金流程
+    /// - Bridge 解锁 Token 到中转账户
+    /// - 中转账户 Deposit 到 Vault（真金）
+    /// - 调用此接口转账到目标用户（账本）
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` 中转账户（注册的 Relayer 地址）
+    /// 1. `[writable]` 中转账户的 UserAccount PDA
+    /// 2. `[writable]` 目标用户的 UserAccount PDA（会自动创建）
+    /// 3. `[]` VaultConfig（验证中转账户已注册）
+    /// 4. `[]` System Program（用于创建目标账户）
+    TransferFromRelay {
+        /// 目标用户钱包地址
+        target_user_wallet: Pubkey,
+        /// 转账金额 (e6)
+        amount: u64,
+    },
 }
 

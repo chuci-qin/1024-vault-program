@@ -191,6 +191,10 @@ impl Processor {
                 msg!("Instruction: RelayerWithdrawAndTransfer");
                 Self::process_relayer_withdraw_and_transfer(program_id, accounts, user_wallet, amount)
             }
+            VaultInstruction::TransferFromRelay { target_user_wallet, amount } => {
+                msg!("Instruction: TransferFromRelay");
+                Self::process_transfer_from_relay(program_id, accounts, target_user_wallet, amount)
+            }
         }
     }
 
@@ -1358,6 +1362,141 @@ impl Processor {
 
         msg!("✅ RelayerWithdrawAndTransfer {} e6 for {} → Relayer (remaining: {})", 
             amount, user_wallet, user_account.available_balance_e6);
+        
+        Ok(())
+    }
+    
+    /// 从中转账户转账到目标用户（账本内转账）
+    /// 
+    /// 功能：
+    /// 1. 验证中转账户签名
+    /// 2. 验证中转账户是注册的 Relayer（在 authorized_callers 中）
+    /// 3. 从中转账户余额扣除
+    /// 4. 增加到目标用户余额（自动创建账户如不存在）
+    fn process_transfer_from_relay(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        target_user_wallet: Pubkey,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let relay_signer = next_account_info(account_info_iter)?;
+        let relay_user_account_info = next_account_info(account_info_iter)?;
+        let target_user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        // 1. 验证中转账户签名
+        assert_signer(relay_signer)?;
+        assert_writable(relay_user_account_info)?;
+        assert_writable(target_user_account_info)?;
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        // 2. 验证中转账户是注册的 Relayer
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        
+        // 检查是否在 authorized_callers 中（作为注册的中转账户）
+        if !vault_config.authorized_callers.contains(relay_signer.key) {
+            msg!("❌ Relay account not authorized: {}", relay_signer.key);
+            return Err(VaultError::UnauthorizedCaller.into());
+        }
+
+        // 3. 验证中转账户的 UserAccount PDA
+        let (relay_pda, _) = Pubkey::find_program_address(
+            &[b"user", relay_signer.key.as_ref()],
+            program_id
+        );
+        if relay_user_account_info.key != &relay_pda {
+            msg!("❌ Invalid relay UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 4. 从中转账户扣款
+        let mut relay_account = deserialize_account::<UserAccount>(&relay_user_account_info.data.borrow())?;
+        
+        if relay_account.wallet != *relay_signer.key {
+            msg!("❌ Relay wallet mismatch");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        if relay_account.available_balance_e6 < amount as i64 {
+            msg!("❌ Relay account insufficient balance: {} < {}", 
+                relay_account.available_balance_e6, amount);
+            return Err(VaultError::InsufficientBalance.into());
+        }
+
+        relay_account.available_balance_e6 = checked_sub(relay_account.available_balance_e6, amount as i64)?;
+        relay_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        relay_account.serialize(&mut &mut relay_user_account_info.data.borrow_mut()[..])?;
+
+        // 5. 验证目标用户 PDA
+        let (target_pda, bump) = Pubkey::find_program_address(
+            &[b"user", target_user_wallet.as_ref()],
+            program_id
+        );
+        if target_user_account_info.key != &target_pda {
+            msg!("❌ Invalid target UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 6. 给目标用户加款（如果账户不存在则创建）
+        if target_user_account_info.data_is_empty() {
+            msg!("Creating target UserAccount for {}", target_user_wallet);
+            
+            let rent = Rent::get()?;
+            let space = USER_ACCOUNT_SIZE;
+            let lamports = rent.minimum_balance(space);
+
+            invoke_signed(
+                &system_instruction::create_account(
+                    relay_signer.key,
+                    target_user_account_info.key,
+                    lamports,
+                    space as u64,
+                    program_id,
+                ),
+                &[relay_signer.clone(), target_user_account_info.clone(), system_program.clone()],
+                &[&[b"user", target_user_wallet.as_ref(), &[bump]]],
+            )?;
+
+            // 初始化目标账户
+            let target_account = UserAccount {
+                discriminator: UserAccount::DISCRIMINATOR,
+                wallet: target_user_wallet,
+                bump,
+                available_balance_e6: amount as i64,
+                locked_margin_e6: 0,
+                unrealized_pnl_e6: 0,
+                total_deposited_e6: amount as i64,
+                total_withdrawn_e6: 0,
+                last_update_ts: solana_program::clock::Clock::get()?.unix_timestamp,
+                reserved: [0; 64],
+            };
+            target_account.serialize(&mut &mut target_user_account_info.data.borrow_mut()[..])?;
+
+            msg!("✅ Created target UserAccount and transferred {} e6", amount);
+        } else {
+            // 更新现有目标账户
+            let mut target_account = deserialize_account::<UserAccount>(&target_user_account_info.data.borrow())?;
+            
+            if target_account.wallet != target_user_wallet {
+                msg!("❌ Target wallet mismatch");
+                return Err(VaultError::InvalidAccount.into());
+            }
+
+            target_account.available_balance_e6 = checked_add(target_account.available_balance_e6, amount as i64)?;
+            target_account.total_deposited_e6 = checked_add(target_account.total_deposited_e6, amount as i64)?;
+            target_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+            target_account.serialize(&mut &mut target_user_account_info.data.borrow_mut()[..])?;
+
+            msg!("✅ Transferred {} e6 to existing target account", amount);
+        }
+
+        msg!("✅ TransferFromRelay: {} e6 from {} → {} (relay remaining: {})", 
+            amount, relay_signer.key, target_user_wallet, relay_account.available_balance_e6);
         
         Ok(())
     }
