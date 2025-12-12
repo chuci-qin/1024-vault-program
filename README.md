@@ -7,14 +7,15 @@
 ## 📋 目录
 
 - [概述](#概述)
+- [部署信息](#部署信息)
 - [架构设计](#架构设计)
 - [账户结构](#账户结构)
 - [指令详解](#指令详解)
+- [跨链桥集成](#跨链桥集成)
 - [PDA 地址推导](#pda-地址推导)
 - [CPI 集成指南](#cpi-集成指南)
 - [安全机制](#安全机制)
 - [构建与部署](#构建与部署)
-- [测试](#测试)
 - [错误代码](#错误代码)
 
 ---
@@ -32,29 +33,55 @@
 | **保证金管理** | 锁定/释放交易保证金 |
 | **清算结算** | 与 Ledger Program 配合的仓位清算 |
 | **预测市场资金** | 独立的预测市场用户账户 |
-| **跨链入金 (Relayer)** | 支持任意链资产无缝入金 |
+| **跨链入金** | 支持 Arbitrum ↔ 1024Chain 跨链桥 |
 
-### 部署信息
+---
 
-| 网络 | Program ID |
-|------|-----------|
-| 1024Chain Testnet | `vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny` |
-| 1024Chain Mainnet | TBD |
+## 部署信息
+
+### 当前版本 (V3)
+
+| 网络 | Program ID | 部署日期 | 状态 |
+|------|-----------|---------|------|
+| **1024Chain Testnet** | `4HfWrrWGsEkZs7yNLX1AHdvtrRGh7VX9S2e92rGkVpyU` | 2025-12-12 | ✅ 生产使用 |
+| Solana Devnet | `5RTrqdYjWeZ8G4yi7P8jBmH8h7rCBkbnNML2dw3jopYM` | 2025-12-12 | 🧪 测试用 |
+
+### V3 新增功能
+
+- ✅ **TransferFromRelay** (#23): 支持中转账户到用户的账本转账
+- ✅ **RelayerWithdrawAndTransfer** (#22): 支持出金并转给Relayer
+- ✅ **Arbitrum ↔ 1024Chain 跨链桥集成**
+- ✅ **真金托管模式**（Token真实存储在Vault）
+
+### 历史版本
+
+| 版本 | Program ID | 状态 |
+|------|-----------|------|
+| V2 | `vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny` | ❌ 已弃用 |
+
+### 网络配置
+
+```bash
+# 1024Chain Testnet
+RPC: https://testnet-rpc.1024chain.com/rpc/
+WebSocket: wss://testnet-rpc.1024chain.com/ws/
+浏览器: https://testnet-scan.1024chain.com/
+```
 
 ### 依赖关系
 
 ```
                     ┌─────────────────────┐
-                    │   1024-vault-program │
-                    │   (资金托管)          │
+                    │   Vault Program V3  │
+                    │   (资金托管 + 跨链)   │
                     └─────────┬───────────┘
                               │
         ┌─────────────────────┼─────────────────────┐
         │                     │                     │
         ▼                     ▼                     ▼
 ┌───────────────┐   ┌─────────────────┐   ┌─────────────────┐
-│ Ledger Program│   │  Fund Program   │   │ Prediction      │
-│ (CPI 调用)     │   │ (保险基金)       │   │ Market Program  │
+│ Ledger Program│   │  Fund Program   │   │ Bridge Program  │
+│ (CPI 调用)     │   │ (保险基金)       │   │ (跨链桥)         │
 └───────────────┘   └─────────────────┘   └─────────────────┘
 ```
 
@@ -78,7 +105,7 @@ Fund Program  = 资金池管理 (保险基金/手续费/返佣)
 │                                                                 │
 │   用户钱包 (Solana/EVM)                                          │
 │       │                                                         │
-│       │  Deposit / RelayerDeposit                               │
+│       │  Deposit / RelayerDeposit / TransferFromRelay           │
 │       ▼                                                         │
 │   ┌─────────────────────────────────────┐                       │
 │   │         Vault Token Account          │                       │
@@ -198,25 +225,6 @@ InitializeUser
 | 1 | `[writable]` | UserAccount PDA |
 | 2 | `[]` | System Program |
 
-**示例 (TypeScript):**
-
-```typescript
-const [userAccountPDA] = await PublicKey.findProgramAddress(
-    [Buffer.from("user"), wallet.publicKey.toBuffer()],
-    VAULT_PROGRAM_ID
-);
-
-const ix = new TransactionInstruction({
-    keys: [
-        { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
-        { pubkey: userAccountPDA, isSigner: false, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ],
-    programId: VAULT_PROGRAM_ID,
-    data: Buffer.from([1]), // InitializeUser instruction index
-});
-```
-
 #### 2. Deposit
 
 用户存入 USDC。
@@ -242,15 +250,6 @@ Deposit { amount: u64 }
 Withdraw { amount: u64 }
 ```
 
-| 账户 | 类型 | 说明 |
-|------|------|------|
-| 0 | `[signer]` | 用户钱包 |
-| 1 | `[writable]` | UserAccount PDA |
-| 2 | `[writable]` | 用户 USDC Token Account |
-| 3 | `[writable]` | Vault USDC Token Account |
-| 4 | `[]` | VaultConfig |
-| 5 | `[]` | Token Program |
-
 ### CPI 操作指令
 
 > ⚠️ 这些指令只能由白名单中的 Program 通过 CPI 调用
@@ -262,12 +261,6 @@ Withdraw { amount: u64 }
 ```rust
 LockMargin { amount: u64 }
 ```
-
-| 账户 | 类型 | 说明 |
-|------|------|------|
-| 0 | `[]` | VaultConfig |
-| 1 | `[writable]` | UserAccount |
-| 2 | `[]` | Caller Program (验证白名单) |
 
 #### 5. ReleaseMargin
 
@@ -334,37 +327,6 @@ PredictionMarketSettle {
 
 用户领取预测市场结算收益。
 
-### Relayer 指令
-
-> 用于跨链入金场景，用户无需在 1024Chain 上签名
-
-#### 13. RelayerDeposit
-
-Relayer 代理入金。
-
-```rust
-RelayerDeposit {
-    user_wallet: Pubkey,  // 目标用户
-    amount: u64,          // 入金金额
-}
-```
-
-**特性:**
-- 如果 UserAccount 不存在，自动创建
-- 仅 Admin 可调用
-- 不涉及实际 Token 转账（余额凭证模式）
-
-#### 14. RelayerWithdraw
-
-Relayer 代理出金。
-
-```rust
-RelayerWithdraw {
-    user_wallet: Pubkey,
-    amount: u64,
-}
-```
-
 ### 管理员指令
 
 | 指令 | 说明 |
@@ -380,6 +342,102 @@ RelayerWithdraw {
 
 ---
 
+## 跨链桥集成
+
+### V3 新增跨链桥指令
+
+#### 22. RelayerWithdrawAndTransfer
+
+Relayer 执行出金操作，从用户账户扣款并转Token给Relayer。
+
+```rust
+RelayerWithdrawAndTransfer {
+    user_wallet: Pubkey,  // 用户钱包地址
+    amount: u64,          // 出金金额
+}
+```
+
+**账户:**
+
+| 账户 | 类型 | 说明 |
+|------|------|------|
+| 0 | `[signer]` | Relayer/Admin |
+| 1 | `[writable]` | UserAccount PDA |
+| 2 | `[writable]` | Vault Token Account |
+| 3 | `[writable]` | Relayer Token Account |
+| 4 | `[]` | VaultConfig |
+| 5 | `[]` | Token Program |
+
+**功能:**
+- 从用户 UserAccount 扣除余额（账本）
+- 执行 Token 转账：Vault TA → Relayer TA
+- Relayer 收到真实 USDC 后，通过 Bridge 跨链到 Arbitrum
+
+#### 23. TransferFromRelay
+
+从中转账户转账到目标用户（账本内转账）。
+
+```rust
+TransferFromRelay {
+    target_user: Pubkey,  // 目标用户钱包
+    amount: u64,          // 转账金额
+}
+```
+
+**账户:**
+
+| 账户 | 类型 | 说明 |
+|------|------|------|
+| 0 | `[signer]` | 中转账户（已授权） |
+| 1 | `[writable]` | 中转账户的 UserAccount |
+| 2 | `[writable]` | 目标用户的 UserAccount |
+| 3 | `[]` | VaultConfig |
+| 4 | `[]` | System Program |
+
+**功能:**
+- 从中转账户余额扣除
+- 增加目标用户余额
+- 纯账本操作，无Token转账
+- 用于跨链入金的最后一步
+
+### 跨链桥入金流程
+
+```
+用户 (Arbitrum)
+  ↓ 转 USDC
+Bridge 合约 (Arbitrum)
+  ↓ emit StakeEvent
+e2s-submitter
+  ┌─ Step 1: Bridge.submit_signature
+  │   ↓ Bridge Vault → 中转TA (真金)
+  ┌─ Step 2: Vault.Deposit
+  │   ↓ 中转TA → Vault TA (真金)
+  └─ Step 3: Vault.TransferFromRelay (#23)
+      ↓ 中转余额 → 目标用户余额 (账本)
+目标用户 Vault 账本 ✅
+```
+
+### 跨链桥出金流程
+
+```
+用户 (MetaMask)
+  ↓ EIP-191 签名
+POST /api/v1/vault-bridge/withdraw
+  ↓
+Vault.RelayerWithdrawAndTransfer (#22)
+  ↓ 扣用户余额（账本）
+  ↓ token::transfer(Vault TA → Relayer TA)
+Relayer 收到 USDC
+  ↓
+Bridge.execute_stake()
+  ↓ emit StakeEvent
+s2e Relayer
+  ↓
+Arbitrum 用户收款 ✅
+```
+
+---
+
 ## PDA 地址推导
 
 ### TypeScript 示例
@@ -387,7 +445,7 @@ RelayerWithdraw {
 ```typescript
 import { PublicKey } from '@solana/web3.js';
 
-const VAULT_PROGRAM_ID = new PublicKey('vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny');
+const VAULT_PROGRAM_ID = new PublicKey('4HfWrrWGsEkZs7yNLX1AHdvtrRGh7VX9S2e92rGkVpyU');
 
 // VaultConfig PDA
 const [vaultConfigPDA] = await PublicKey.findProgramAddress(
@@ -495,11 +553,11 @@ if !vault_config.is_authorized_caller(caller_program.key) {
 - 暂停状态下禁止所有用户操作
 - 紧急情况下的保护措施
 
-### 4. Relayer 安全
+### 4. 跨链桥安全
 
-- 仅 Admin 可执行 Relayer 操作
-- 跨链消息由后端验证
-- 出金需确保链下资金到位
+- 中转账户必须在 authorized_callers 白名单中
+- TransferFromRelay 只能由授权账户调用
+- 真金托管：Token 真实存储在 Vault Token Account
 
 ---
 
@@ -516,47 +574,34 @@ cargo check
 # 运行测试
 cargo test --lib
 
-# 构建 BPF 程序
+# 构建 SBF 程序
 cargo build-sbf
 ```
 
-### 部署
+### 部署到 1024Chain
 
 ```bash
-# 部署到 1024Chain Testnet
+# 配置网络
+solana config set --url https://testnet-rpc.1024chain.com/rpc/ \
+    --ws wss://testnet-rpc.1024chain.com/ws/
+
+# 部署（使用已有的 Program Keypair）
 solana program deploy target/deploy/vault_program.so \
-    --url https://testnet-rpc.1024chain.com/rpc/ \
-    --program-id vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny \
-    --use-rpc
+    --keypair faucet.json \
+    --program-id vault-program-keypair.json
+
+# 验证部署
+solana program show 4HfWrrWGsEkZs7yNLX1AHdvtrRGh7VX9S2e92rGkVpyU
 ```
 
----
-
-## 测试
-
-### 单元测试覆盖
-
-| 测试项 | 文件 | 状态 |
-|--------|------|------|
-| UserAccount equity 计算 | `state.rs` | ✅ |
-| VaultConfig authorized_caller | `state.rs` | ✅ |
-| PredictionMarketUserAccount 锁定/释放 | `state.rs` | ✅ |
-| 预测市场结算盈亏计算 | `state.rs` | ✅ |
-| 安全数学运算 | `utils.rs` | ✅ |
-
-### 运行测试
+### 升级程序
 
 ```bash
-cargo test --lib
-
-# 输出:
-# running 6 tests
-# test state::tests::test_user_account_equity ... ok
-# test state::tests::test_vault_config_authorized_caller ... ok
-# test state::tests::test_prediction_market_user_account_creation ... ok
-# test state::tests::test_prediction_market_lock_unlock ... ok
-# test state::tests::test_prediction_market_settle ... ok
-# test state::tests::test_prediction_market_settle_with_profit ... ok
+# 升级使用相同的 Program Keypair
+solana program deploy target/deploy/vault_program.so \
+    --keypair faucet.json \
+    --program-id vault-program-keypair.json \
+    --upgrade-authority 267TEwwHkJUHz42TLNggDCecNhYHFxcRALmR17bPkvU8
 ```
 
 ---
@@ -585,15 +630,24 @@ cargo test --lib
 ├── Cargo.toml
 ├── README.md
 ├── rust-toolchain.toml
+├── vault-program-keypair.json    # Program Keypair (V3)
 └── src/
-    ├── lib.rs          # 程序入口点
-    ├── state.rs        # 账户结构定义
-    ├── instruction.rs  # 指令枚举定义
-    ├── processor.rs    # 指令处理逻辑
-    ├── error.rs        # 错误类型
-    ├── utils.rs        # 工具函数
-    └── cpi.rs          # CPI Helper 函数
+    ├── lib.rs                     # 程序入口点
+    ├── state.rs                   # 账户结构定义
+    ├── instruction.rs             # 指令枚举定义 (24个指令)
+    ├── processor.rs               # 指令处理逻辑
+    ├── error.rs                   # 错误类型
+    ├── utils.rs                   # 工具函数
+    └── cpi.rs                     # CPI Helper 函数
 ```
+
+---
+
+## 相关文档
+
+- **跨链桥开发文档**: `/docs/evm-adapter.md`
+- **1024Chain配置**: `/当前配置信息.md`
+- **部署总结**: `/vault-v3-deployment-summary.md`
 
 ---
 
@@ -603,4 +657,6 @@ MIT
 
 ---
 
-*Last Updated: 2025-12-09*
+**当前版本**: V3  
+**Program ID**: `4HfWrrWGsEkZs7yNLX1AHdvtrRGh7VX9S2e92rGkVpyU`  
+**最后更新**: 2025-12-12
