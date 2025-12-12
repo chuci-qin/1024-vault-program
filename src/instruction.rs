@@ -286,19 +286,28 @@ pub enum VaultInstruction {
 
     /// Relayer 代理入金 (Admin/Relayer only)
     /// 
-    /// 用途：当用户在 Solana 主网/Arbitrum 等链转账后，
-    /// 由授权的 Relayer 代替用户在 1024Chain 上入金到 Vault
+    /// 用途：跨链桥入金 - Bridge Listener 代表用户完成入金
+    /// 
+    /// 流程：
+    /// 1. 用户在 Arbitrum 转 USDC → Bridge
+    /// 2. Bridge.submit_signature → 管理员 Token Account
+    /// 3. Bridge Listener 调用此指令
+    /// 4. Token 从管理员 TA → Vault TA (真金)
+    /// 5. 用户账本余额增加
     /// 
     /// 特性：
     /// - 如果用户 UserAccount 不存在，会自动创建
-    /// - 仅 Admin 可调用 (测试网自由入金)
-    /// - 不涉及实际 Token Transfer（余额凭证模式）
+    /// - 仅 Admin 可调用
+    /// - 🆕 涉及真实 Token Transfer (真金模式)
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
     /// 1. `[writable]` UserAccount PDA (会自动创建)
-    /// 2. `[writable]` VaultConfig
-    /// 3. `[]` System Program (用于创建账户)
+    /// 2. `[writable]` Admin USDC Token Account (转出方)
+    /// 3. `[writable]` Vault USDC Token Account (接收方)
+    /// 4. `[writable]` VaultConfig
+    /// 5. `[]` Token Program
+    /// 6. `[]` System Program (用于创建账户)
     RelayerDeposit {
         /// 目标用户钱包地址
         user_wallet: Pubkey,

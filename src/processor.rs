@@ -1064,7 +1064,10 @@ impl Processor {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
+        let admin_token_account = next_account_info(account_info_iter)?;  // 🆕 添加
+        let vault_token_account = next_account_info(account_info_iter)?;  // 🆕 添加
         let vault_config_info = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;        // 🆕 添加
         let system_program = next_account_info(account_info_iter)?;
 
         // 1. 验证 admin 签名和账户可写
@@ -1160,8 +1163,29 @@ impl Processor {
                 amount, user_wallet, user_account.available_balance_e6);
         }
 
+        // 🆕 真金模式：Token Transfer from Admin → Vault
+        msg!("💰 Transferring real USDC: Admin TA → Vault TA");
+        let transfer_ix = spl_token::instruction::transfer(
+            token_program.key,
+            admin_token_account.key,
+            vault_token_account.key,
+            admin.key,
+            &[],
+            amount,
+        )?;
+        
+        invoke(
+            &transfer_ix,
+            &[
+                admin_token_account.clone(),
+                vault_token_account.clone(),
+                admin.clone(),
+                token_program.clone(),
+            ],
+        )?;
+        msg!("✅ Token transferred: {} USDC", amount as f64 / 1_000_000.0);
+
         // 注意: 跳过更新 VaultConfig.total_deposits (兼容旧版结构)
-        // 这是测试网的简化实现
 
         Ok(())
     }
