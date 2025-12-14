@@ -915,12 +915,26 @@ impl Processor {
     }
 
     /// 预测市场锁定 (CPI only)
+    /// 
+    /// 如果 PMUserAccount 不存在，会自动创建（需要额外的 payer 和 system_program 账户）
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount
+    /// 2. `[writable]` PMUserAccount PDA
+    /// 3. `[]` Caller Program
+    /// 4. `[signer, writable]` Payer (optional, for auto-init)
+    /// 5. `[]` System Program (optional, for auto-init)
     fn process_prediction_market_lock(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
         let pm_user_account_info = next_account_info(account_info_iter)?;
         let caller_program = next_account_info(account_info_iter)?;
+        
+        // Optional accounts for auto-init
+        let payer_info = next_account_info(account_info_iter).ok();
+        let system_program_info = next_account_info(account_info_iter).ok();
 
         assert_writable(user_account_info)?;
         assert_writable(pm_user_account_info)?;
@@ -940,6 +954,56 @@ impl Processor {
         user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
         user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        // Auto-init PMUserAccount if empty
+        if pm_user_account_info.data_is_empty() {
+            msg!("Auto-initializing PMUserAccount for {}", user_account.wallet);
+            
+            let payer = payer_info.ok_or_else(|| {
+                msg!("❌ PMUserAccount not initialized and no payer provided");
+                VaultError::InvalidAccount
+            })?;
+            let system_program = system_program_info.ok_or_else(|| {
+                msg!("❌ PMUserAccount not initialized and no system_program provided");
+                VaultError::InvalidAccount
+            })?;
+            
+            // Derive PDA to get bump
+            let (pm_user_pda, bump) = Pubkey::find_program_address(
+                &[PREDICTION_MARKET_USER_SEED, user_account.wallet.as_ref()],
+                vault_config_info.owner, // Vault Program ID
+            );
+            
+            if pm_user_account_info.key != &pm_user_pda {
+                msg!("❌ Invalid PMUserAccount PDA");
+                return Err(VaultError::InvalidPda.into());
+            }
+            
+            let rent = Rent::get()?;
+            let space = PREDICTION_MARKET_USER_ACCOUNT_SIZE;
+            let lamports = rent.minimum_balance(space);
+            
+            // Create account with PDA seeds
+            invoke_signed(
+                &system_instruction::create_account(
+                    payer.key,
+                    pm_user_account_info.key,
+                    lamports,
+                    space as u64,
+                    vault_config_info.owner, // Vault Program ID
+                ),
+                &[payer.clone(), pm_user_account_info.clone(), system_program.clone()],
+                &[&[PREDICTION_MARKET_USER_SEED, user_account.wallet.as_ref(), &[bump]]],
+            )?;
+            
+            let pm_user_account = PredictionMarketUserAccount::new(
+                user_account.wallet,
+                bump,
+                solana_program::clock::Clock::get()?.unix_timestamp,
+            );
+            pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+            msg!("✅ PMUserAccount auto-initialized for {}", user_account.wallet);
+        }
 
         // 增加 PredictionMarketUserAccount
         let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;

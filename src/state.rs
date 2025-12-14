@@ -345,18 +345,23 @@ mod tests {
         let other = Pubkey::new_unique();
         let authorized = Pubkey::new_unique();
         
+        // Create authorized_callers array with the authorized key
+        let mut authorized_callers = [Pubkey::default(); 10];
+        authorized_callers[0] = authorized;
+        
         let config = VaultConfig {
             discriminator: VaultConfig::DISCRIMINATOR,
             admin: Pubkey::new_unique(),
             usdc_mint: Pubkey::new_unique(),
             vault_token_account: Pubkey::new_unique(),
-            authorized_callers: vec![authorized],
+            authorized_callers,
             ledger_program: ledger,
-            fund_program: Some(fund),
+            fund_program: fund,
             delegation_program: Pubkey::new_unique(),
             total_deposits: 0,
             total_locked: 0,
             is_paused: false,
+            reserved: [0u8; 32],
         };
         
         assert!(config.is_authorized_caller(&ledger));
