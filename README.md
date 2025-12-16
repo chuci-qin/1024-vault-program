@@ -101,6 +101,122 @@ Fund Program  = 资金池管理 (保险基金/手续费/返佣)
 
 ---
 
+## 🎯 一体化账户架构
+
+### 设计理念
+
+1024 DEX 采用**一体化账户架构**，交易所（永续合约）和预测市场**共享同一个入金 Vault**，用户只需管理一个账户即可在两个市场自由交易。
+
+### 为什么需要 PMUserAccount？
+
+> **核心问题**: 既然是一体化，为什么还要有独立的 `PMUserAccount` PDA？
+
+**答案**: `PMUserAccount` 不是"独立账户"，而是"锁定资金追踪器"。两个市场共享 `UserAccount.available_balance`，只是**锁定部分分开追踪**。
+
+### 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        Vault Program 一体化架构                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │                 UserAccount PDA (主账户 - 共享)                    │ │
+│  │  ┌───────────────────────────────────────────────────────────┐   │ │
+│  │  │ 💰 available_balance_e6   ← 入金/出金在这里                │   │ │
+│  │  │    (交易所 + 预测市场共享)                                 │   │ │
+│  │  └───────────────────────────────────────────────────────────┘   │ │
+│  │  ┌───────────────────────────────────────────────────────────┐   │ │
+│  │  │ 🔐 locked_margin_e6      ← 交易所锁定保证金                │   │ │
+│  │  │    (永续合约开仓)                                          │   │ │
+│  │  └───────────────────────────────────────────────────────────┘   │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                                    │                                    │
+│                     ┌──────────────┴──────────────┐                    │
+│                     │      available_balance      │                    │
+│                     │         可自由分配           │                    │
+│                     └──────────────┬──────────────┘                    │
+│                                    │                                    │
+│            ┌───────────────────────┼───────────────────────┐           │
+│            │                       │                       │           │
+│            ▼                       │                       ▼           │
+│   ┌─────────────────┐              │              ┌─────────────────┐  │
+│   │ 交易所下单       │              │              │ 预测市场下单     │  │
+│   │ (永续合约)       │              │              │ (CTF 市场)      │  │
+│   │                 │              │              │                 │  │
+│   │ → locked_margin │              │              │ → pm_locked     │  │
+│   │   (在 UserAccount)             │              │   (在 PMUserAccount)│
+│   └─────────────────┘              │              └─────────────────┘  │
+│                                    │                                    │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │              PMUserAccount PDA (预测市场锁定追踪器)                │ │
+│  │  ┌───────────────────────────────────────────────────────────┐   │ │
+│  │  │ 🔒 pm_locked_e6           ← 预测市场锁定（挂单保证金）     │   │ │
+│  │  └───────────────────────────────────────────────────────────┘   │ │
+│  │  ┌───────────────────────────────────────────────────────────┐   │ │
+│  │  │ 📤 pm_pending_settlement_e6  ← 待结算收益（市场结算后）    │   │ │
+│  │  └───────────────────────────────────────────────────────────┘   │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 资金流向示例
+
+```
+用户入金 $1000:
+  └→ UserAccount.available_balance = $1000
+
+交易所开仓 $300 保证金:
+  ├→ UserAccount.available_balance = $700  (扣除)
+  └→ UserAccount.locked_margin = $300      (锁定)
+
+预测市场下单 $200:
+  ├→ UserAccount.available_balance = $500  (继续扣除)
+  └→ PMUserAccount.pm_locked = $200        (预测市场锁定)
+
+剩余可用: $500 (可在两个市场继续使用)
+
+预测市场取消订单:
+  ├→ PMUserAccount.pm_locked = $0
+  └→ UserAccount.available_balance = $700  (返还)
+```
+
+### 为什么分开追踪？
+
+| 原因 | 交易所 | 预测市场 |
+|------|--------|---------|
+| **风险模型** | 杠杆交易，需要维持保证金率，可能爆仓 | 无杠杆，不存在爆仓 |
+| **结算机制** | 盈亏实时结算到 available_balance | 市场结束后才能结算，有 pending_settlement |
+| **锁定目的** | 防止亏损超过保证金 | 确保订单有足够抵押 |
+
+### 用户视角（前端显示）
+
+```
+┌────────────────────────────────────────────────────────┐
+│ 💼 Account Overview                                    │
+├────────────────────────────────────────────────────────┤
+│ 💰 Total Balance:     $1,000.00                        │
+│ ─────────────────────────────────────────────────────  │
+│ 🟢 Available:         $500.00                          │
+│ 🔐 Locked (Perp):     $300.00  ← locked_margin         │
+│ 🔒 Locked (PM):       $200.00  ← pm_locked             │
+└────────────────────────────────────────────────────────┘
+```
+
+**用户感知不到有两个账户**，他们只看到一个统一的资金面板。
+
+### 一体化需求满足情况
+
+| 需求 | 满足 | 说明 |
+|------|------|------|
+| 共用一个入金 Vault | ✅ | 用户只入金到 UserAccount |
+| 共用 available_balance | ✅ | 两个市场从同一余额扣款 |
+| 一个账户两个市场下单 | ✅ | 同一笔资金可同时使用 |
+| 用户只需管理一个账户 | ✅ | 只需一次入金 |
+
+---
+
 ## 账户结构
 
 ### 1. VaultConfig (全局配置)
@@ -469,6 +585,57 @@ fn verify_cpi_caller(
 }
 ```
 
+### ⚠️ 重要：Prediction Market CPI 授权
+
+**添加到 `authorized_callers` 的应该是 PM Config PDA，而不是 PM Program ID！**
+
+```typescript
+// ✅ 正确 - 添加 PM Config PDA
+const PM_CONFIG_PDA = "BLPdJuvYHzUf1mcNTEBQHHt1SzD3LxTgsNqQe5tCeD1k";
+
+// ❌ 错误 - PM Program ID 不是 CPI caller
+const PM_PROGRAM_ID = "FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58";
+```
+
+**原因**: PM Program 通过 `invoke_signed` 使用 PM Config PDA 作为签名者调用 Vault CPI：
+
+```rust
+// PM Program 的 CPI 调用
+cpi_lock_for_prediction(
+    vault_program,
+    vault_config,
+    user_account,
+    pm_user_account,
+    config_info,      // ← PM Config PDA，这是 CPI caller
+    amount,
+    &[PM_CONFIG_SEED, &[config_bump]], // PDA 签名
+)?;
+```
+
+### 添加 PM Config PDA 到白名单
+
+```bash
+cd onchain-program/scripts
+npx ts-node add-pm-to-vault-whitelist.ts
+```
+
+或手动调用 `AddAuthorizedCaller` 指令：
+
+```typescript
+const data = Buffer.alloc(1 + 32);
+data.writeUInt8(8, 0); // AddAuthorizedCaller instruction index
+PM_CONFIG_PDA.toBuffer().copy(data, 1);
+
+const ix = new TransactionInstruction({
+    programId: VAULT_PROGRAM_ID,
+    keys: [
+        { pubkey: admin, isSigner: true, isWritable: false },
+        { pubkey: vaultConfig, isSigner: false, isWritable: true },
+    ],
+    data,
+});
+```
+
 ---
 
 ## 安全机制
@@ -603,4 +770,16 @@ MIT
 
 ---
 
-*Last Updated: 2025-12-09*
+*Last Updated: 2025-12-17*
+
+---
+
+## 更新日志
+
+### 2025-12-17
+- 添加"一体化账户架构"章节，详细说明交易所和预测市场共享账户的设计理念
+- 添加 PM Config PDA 授权说明，强调 CPI caller 是 PDA 而非 Program ID
+- 更新 CPI 集成指南
+
+### 2025-12-09
+- 初始版本
