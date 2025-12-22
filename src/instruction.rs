@@ -290,6 +290,117 @@ pub enum VaultInstruction {
         amount: u64,
     },
 
+    /// 预测市场锁定 USDC 并扣除手续费 (CPI only - 由 Prediction Market Program 调用)
+    /// 
+    /// V2 Fee Architecture: 在 Vault 层面收取手续费
+    /// 
+    /// 流程:
+    /// 1. 从 UserAccount.available_balance 扣除 gross_amount
+    /// 2. 读取 PM Fee Config 获取 minting_fee_bps
+    /// 3. 计算 fee = gross_amount * fee_bps / 10000
+    /// 4. net_amount = gross_amount - fee
+    /// 5. 增加 PredictionMarketUserAccount.prediction_market_locked += net_amount
+    /// 6. spl_token::transfer(Vault Token Account → PM Fee Vault, fee)
+    /// 7. 更新 PM Fee Config 统计
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount (扣除 available_balance)
+    /// 2. `[writable]` PredictionMarketUserAccount (增加 prediction_market_locked)
+    /// 3. `[]` Caller Program (验证白名单)
+    /// 4. `[writable]` Vault Token Account (源账户)
+    /// 5. `[writable]` PM Fee Vault (目标账户)
+    /// 6. `[writable]` PM Fee Config PDA (更新统计)
+    /// 7. `[]` Token Program
+    /// 8. `[signer, writable]` Payer (for auto-init, optional)
+    /// 9. `[]` System Program (for auto-init, optional)
+    PredictionMarketLockWithFee {
+        /// 用户输入的总金额 (e6)，包含手续费
+        gross_amount: u64,
+    },
+
+    /// 预测市场释放锁定并扣除手续费 (CPI only)
+    /// 
+    /// V2 Fee Architecture: 在 Vault 层面收取赎回手续费
+    /// 
+    /// 流程:
+    /// 1. 从 PredictionMarketUserAccount.prediction_market_locked 扣除 gross_amount
+    /// 2. 读取 PM Fee Config 获取 redemption_fee_bps
+    /// 3. 计算 fee = gross_amount * fee_bps / 10000
+    /// 4. net_amount = gross_amount - fee
+    /// 5. 增加 UserAccount.available_balance += net_amount
+    /// 6. spl_token::transfer(Vault Token Account → PM Fee Vault, fee)
+    /// 7. 更新 PM Fee Config 统计
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount
+    /// 2. `[writable]` PredictionMarketUserAccount
+    /// 3. `[]` Caller Program
+    /// 4. `[writable]` Vault Token Account
+    /// 5. `[writable]` PM Fee Vault
+    /// 6. `[writable]` PM Fee Config PDA
+    /// 7. `[]` Token Program
+    PredictionMarketUnlockWithFee {
+        /// 要释放的金额 (e6)
+        gross_amount: u64,
+    },
+
+    /// 预测市场交易费收取 (CPI only - 由 Prediction Market Program 调用)
+    /// 
+    /// V2 Fee Architecture: 交易撮合时收取 Taker/Maker 费用
+    /// 
+    /// 流程:
+    /// 1. 读取 PM Fee Config 获取 taker_fee_bps / maker_fee_bps
+    /// 2. 计算 taker_fee = trade_amount * taker_fee_bps / 10000
+    /// 3. 计算 maker_fee = trade_amount * maker_fee_bps / 10000 (可为0或负数表示返佣)
+    /// 4. 从 Vault Token Account 转账 (taker_fee + maker_fee) → PM Fee Vault
+    /// 5. 更新 PM Fee Config 统计 (total_trading_fee)
+    /// 
+    /// 注意: 此指令仅收取费用，不修改用户余额。余额调整由 PM Program 在调用前完成。
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[]` Caller Program (验证白名单)
+    /// 2. `[writable]` Vault Token Account (源账户)
+    /// 3. `[writable]` PM Fee Vault (目标账户)
+    /// 4. `[writable]` PM Fee Config PDA (更新统计)
+    /// 5. `[]` Token Program
+    PredictionMarketTradeWithFee {
+        /// 交易金额 (e6)，用于计算费用
+        trade_amount: u64,
+        /// 是否为 Taker (true=Taker, false=Maker)
+        is_taker: bool,
+    },
+
+    /// 预测市场结算并扣除手续费 (CPI only)
+    /// 
+    /// V2 Fee Architecture: 市场结算时收取结算费
+    /// 
+    /// 流程:
+    /// 1. 从 PredictionMarketUserAccount.prediction_market_locked 扣除 locked_amount
+    /// 2. 读取 PM Fee Config 获取 settlement_fee_bps
+    /// 3. 计算 fee = settlement_amount * fee_bps / 10000
+    /// 4. net_settlement = settlement_amount - fee
+    /// 5. 将 net_settlement 记入 PredictionMarketUserAccount.prediction_market_pending_settlement
+    /// 6. spl_token::transfer(Vault Token Account → PM Fee Vault, fee)
+    /// 7. 更新 PM Fee Config 统计
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` PredictionMarketUserAccount
+    /// 2. `[]` Caller Program
+    /// 3. `[writable]` Vault Token Account (源账户)
+    /// 4. `[writable]` PM Fee Vault (目标账户)
+    /// 5. `[writable]` PM Fee Config PDA
+    /// 6. `[]` Token Program
+    PredictionMarketSettleWithFee {
+        /// 用户原锁定金额 (e6)
+        locked_amount: u64,
+        /// 结算应得金额 (e6)，扣除手续费后入账
+        settlement_amount: u64,
+    },
+
     // =========================================================================
     // Relayer 指令 - 用于跨链入金/出金
     // =========================================================================
