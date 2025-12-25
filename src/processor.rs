@@ -227,6 +227,68 @@ impl Processor {
                 msg!("Instruction: RelayerWithdraw");
                 Self::process_relayer_withdraw(program_id, accounts, user_wallet, amount)
             }
+            
+            // Spot 交易指令
+            VaultInstruction::InitializeSpotUser => {
+                msg!("Instruction: InitializeSpotUser");
+                Self::process_initialize_spot_user(program_id, accounts)
+            }
+            VaultInstruction::SpotDeposit { token_index, amount } => {
+                msg!("Instruction: SpotDeposit");
+                Self::process_spot_deposit(program_id, accounts, token_index, amount)
+            }
+            VaultInstruction::SpotWithdraw { token_index, amount } => {
+                msg!("Instruction: SpotWithdraw");
+                Self::process_spot_withdraw(program_id, accounts, token_index, amount)
+            }
+            VaultInstruction::SpotLockBalance { token_index, amount } => {
+                msg!("Instruction: SpotLockBalance");
+                Self::process_spot_lock_balance(accounts, token_index, amount)
+            }
+            VaultInstruction::SpotUnlockBalance { token_index, amount } => {
+                msg!("Instruction: SpotUnlockBalance");
+                Self::process_spot_unlock_balance(accounts, token_index, amount)
+            }
+            VaultInstruction::SpotSettleTrade { is_buy, base_token_index, quote_token_index, base_amount, quote_amount, sequence } => {
+                msg!("Instruction: SpotSettleTrade");
+                Self::process_spot_settle_trade(accounts, is_buy, base_token_index, quote_token_index, base_amount, quote_amount, sequence)
+            }
+            VaultInstruction::RelayerSpotDeposit { user_wallet, token_index, amount } => {
+                msg!("Instruction: RelayerSpotDeposit");
+                Self::process_relayer_spot_deposit(program_id, accounts, user_wallet, token_index, amount)
+            }
+            VaultInstruction::RelayerSpotWithdraw { user_wallet, token_index, amount } => {
+                msg!("Instruction: RelayerSpotWithdraw");
+                Self::process_relayer_spot_withdraw(program_id, accounts, user_wallet, token_index, amount)
+            }
+            VaultInstruction::RelayerSpotSettleTrade { 
+                maker_wallet, 
+                taker_wallet, 
+                base_token_index, 
+                quote_token_index, 
+                base_amount_e6, 
+                quote_amount_e6, 
+                maker_fee_e6, 
+                taker_fee_e6, 
+                taker_is_buy, 
+                sequence 
+            } => {
+                msg!("Instruction: RelayerSpotSettleTrade");
+                Self::process_relayer_spot_settle_trade(
+                    program_id, 
+                    accounts, 
+                    maker_wallet, 
+                    taker_wallet, 
+                    base_token_index, 
+                    quote_token_index, 
+                    base_amount_e6, 
+                    quote_amount_e6, 
+                    maker_fee_e6, 
+                    taker_fee_e6, 
+                    taker_is_buy, 
+                    sequence
+                )
+            }
         }
     }
 
@@ -2029,6 +2091,522 @@ impl Processor {
 
         msg!("✅ PredictionMarketSettleWithFee completed: locked={}, settlement={}, fee={}, net={}", 
              locked_amount, settlement_amount, fee_amount, net_settlement);
+        Ok(())
+    }
+
+    // =========================================================================
+    // Spot 交易指令处理
+    // =========================================================================
+
+    /// 初始化 Spot 用户账户
+    fn process_initialize_spot_user(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let user = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        assert_signer(user)?;
+
+        // 验证 PDA
+        let (spot_user_pda, spot_user_bump) = Pubkey::find_program_address(
+            &[SPOT_USER_SEED, user.key.as_ref()],
+            program_id,
+        );
+
+        if spot_user_account_info.key != &spot_user_pda {
+            msg!("❌ Invalid SpotUserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 检查是否已初始化
+        if !spot_user_account_info.data_is_empty() {
+            msg!("SpotUserAccount already initialized");
+            return Err(VaultError::AlreadyInitialized.into());
+        }
+
+        // 创建账户
+        let rent = Rent::get()?;
+        let space = SPOT_USER_ACCOUNT_SIZE;
+        let lamports = rent.minimum_balance(space);
+
+        invoke_signed(
+            &system_instruction::create_account(
+                user.key,
+                spot_user_account_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[user.clone(), spot_user_account_info.clone(), system_program.clone()],
+            &[&[SPOT_USER_SEED, user.key.as_ref(), &[spot_user_bump]]],
+        )?;
+
+        // 初始化数据
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        let spot_user = SpotUserAccount::new(*user.key, spot_user_bump, current_ts);
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotUserAccount initialized for {}", user.key);
+        Ok(())
+    }
+
+    /// Spot Token 入金 (用户直接调用)
+    fn process_spot_deposit(
+        _program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        token_index: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let user = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let user_token_account = next_account_info(account_info_iter)?;
+        let vault_token_account = next_account_info(account_info_iter)?;
+        let _vault_config_info = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+
+        assert_signer(user)?;
+
+        // 验证 SpotUserAccount 所有权
+        let mut spot_user = deserialize_account::<SpotUserAccount>(&spot_user_account_info.data.borrow())?;
+        if spot_user.wallet != *user.key {
+            return Err(VaultError::UnauthorizedUser.into());
+        }
+
+        // 执行 Token 转账
+        invoke(
+            &spl_token::instruction::transfer(
+                token_program.key,
+                user_token_account.key,
+                vault_token_account.key,
+                user.key,
+                &[],
+                amount,
+            )?,
+            &[
+                user_token_account.clone(),
+                vault_token_account.clone(),
+                user.clone(),
+                token_program.clone(),
+            ],
+        )?;
+
+        // 更新 SpotUserAccount 余额
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        spot_user.deposit(token_index, amount as i64, current_ts)
+            .map_err(|_| VaultError::DepositFailed)?;
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotDeposit: token_index={}, amount={}", token_index, amount);
+        Ok(())
+    }
+
+    /// Spot Token 出金 (用户直接调用)
+    fn process_spot_withdraw(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        token_index: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let user = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let user_token_account = next_account_info(account_info_iter)?;
+        let vault_token_account = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+
+        assert_signer(user)?;
+
+        // 验证 SpotUserAccount 所有权
+        let mut spot_user = deserialize_account::<SpotUserAccount>(&spot_user_account_info.data.borrow())?;
+        if spot_user.wallet != *user.key {
+            return Err(VaultError::UnauthorizedUser.into());
+        }
+
+        // 检查余额
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        spot_user.withdraw(token_index, amount as i64, current_ts)
+            .map_err(|_| VaultError::InsufficientBalance)?;
+
+        // 获取 VaultConfig PDA 用于签名
+        let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(
+            &[b"vault_config"],
+            program_id,
+        );
+        if vault_config_info.key != &vault_config_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 执行 Token 转账
+        invoke_signed(
+            &spl_token::instruction::transfer(
+                token_program.key,
+                vault_token_account.key,
+                user_token_account.key,
+                vault_config_info.key,
+                &[],
+                amount,
+            )?,
+            &[
+                vault_token_account.clone(),
+                user_token_account.clone(),
+                vault_config_info.clone(),
+                token_program.clone(),
+            ],
+            &[&[b"vault_config", &[vault_config_bump]]],
+        )?;
+
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotWithdraw: token_index={}, amount={}", token_index, amount);
+        Ok(())
+    }
+
+    /// Spot 锁定余额 (CPI only)
+    fn process_spot_lock_balance(
+        accounts: &[AccountInfo],
+        token_index: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        // 验证 CPI 调用方
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        // 锁定余额
+        let mut spot_user = deserialize_account::<SpotUserAccount>(&spot_user_account_info.data.borrow())?;
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        spot_user.lock_balance(token_index, amount as i64, current_ts)
+            .map_err(|_| VaultError::InsufficientBalance)?;
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotLockBalance: token_index={}, amount={}", token_index, amount);
+        Ok(())
+    }
+
+    /// Spot 解锁余额 (CPI only)
+    fn process_spot_unlock_balance(
+        accounts: &[AccountInfo],
+        token_index: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        // 验证 CPI 调用方
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        // 解锁余额
+        let mut spot_user = deserialize_account::<SpotUserAccount>(&spot_user_account_info.data.borrow())?;
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        spot_user.unlock_balance(token_index, amount as i64, current_ts)
+            .map_err(|_| VaultError::InsufficientBalance)?;
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotUnlockBalance: token_index={}, amount={}", token_index, amount);
+        Ok(())
+    }
+
+    /// Spot 交易结算 (CPI only)
+    fn process_spot_settle_trade(
+        accounts: &[AccountInfo],
+        is_buy: bool,
+        base_token_index: u16,
+        quote_token_index: u16,
+        base_amount: u64,
+        quote_amount: u64,
+        sequence: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        // 验证 CPI 调用方
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        // 执行结算
+        let mut spot_user = deserialize_account::<SpotUserAccount>(&spot_user_account_info.data.borrow())?;
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        spot_user.settle_trade(
+            is_buy,
+            base_token_index,
+            quote_token_index,
+            base_amount as i64,
+            quote_amount as i64,
+            sequence,
+            current_ts,
+        ).map_err(|e| {
+            msg!("SpotSettleTrade error: {}", e);
+            VaultError::SettlementFailed
+        })?;
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotSettleTrade: is_buy={}, base={}, quote={}, seq={}", 
+             is_buy, base_amount, quote_amount, sequence);
+        Ok(())
+    }
+
+    /// Relayer 代理 Spot 入金
+    fn process_relayer_spot_deposit(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        token_index: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+
+        // 验证 Admin
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        // 验证/创建 SpotUserAccount PDA
+        let (spot_user_pda, spot_user_bump) = Pubkey::find_program_address(
+            &[SPOT_USER_SEED, user_wallet.as_ref()],
+            program_id,
+        );
+
+        if spot_user_account_info.key != &spot_user_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+
+        // 如果账户不存在则创建
+        if spot_user_account_info.data_is_empty() {
+            let rent = Rent::get()?;
+            let space = SPOT_USER_ACCOUNT_SIZE;
+            let lamports = rent.minimum_balance(space);
+
+            invoke_signed(
+                &system_instruction::create_account(
+                    admin.key,
+                    spot_user_account_info.key,
+                    lamports,
+                    space as u64,
+                    program_id,
+                ),
+                &[admin.clone(), spot_user_account_info.clone(), system_program.clone()],
+                &[&[SPOT_USER_SEED, user_wallet.as_ref(), &[spot_user_bump]]],
+            )?;
+
+            let spot_user = SpotUserAccount::new(user_wallet, spot_user_bump, current_ts);
+            spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+            msg!("Created SpotUserAccount for {}", user_wallet);
+        }
+
+        // 增加余额
+        let mut spot_user = deserialize_account::<SpotUserAccount>(&spot_user_account_info.data.borrow())?;
+        spot_user.deposit(token_index, amount as i64, current_ts)
+            .map_err(|_| VaultError::DepositFailed)?;
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ RelayerSpotDeposit: user={}, token_index={}, amount={}", user_wallet, token_index, amount);
+        Ok(())
+    }
+
+    /// Relayer 代理 Spot 出金
+    fn process_relayer_spot_withdraw(
+        _program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        token_index: u16,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let spot_user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+
+        // 验证 Admin
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        // 验证 SpotUserAccount 所有权
+        let mut spot_user = deserialize_account::<SpotUserAccount>(&spot_user_account_info.data.borrow())?;
+        if spot_user.wallet != user_wallet {
+            return Err(VaultError::UnauthorizedUser.into());
+        }
+
+        // 扣除余额
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        spot_user.withdraw(token_index, amount as i64, current_ts)
+            .map_err(|_| VaultError::InsufficientBalance)?;
+        spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ RelayerSpotWithdraw: user={}, token_index={}, amount={}", user_wallet, token_index, amount);
+        Ok(())
+    }
+
+    /// Relayer 代理 Spot 交易结算
+    /// 
+    /// CEX 级体验：用户交易无需签名，由 Relayer 代理结算
+    /// 
+    /// 流程:
+    /// 1. Taker 是买方时:
+    ///    - Taker: -locked[quote], +available[base]
+    ///    - Maker: -locked[base], +available[quote]
+    /// 2. Taker 是卖方时:
+    ///    - Taker: -locked[base], +available[quote]
+    ///    - Maker: -locked[quote], +available[base]
+    fn process_relayer_spot_settle_trade(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        maker_wallet: Pubkey,
+        taker_wallet: Pubkey,
+        base_token_index: u16,
+        quote_token_index: u16,
+        base_amount_e6: i64,
+        quote_amount_e6: i64,
+        _maker_fee_e6: i64,
+        _taker_fee_e6: i64,
+        taker_is_buy: bool,
+        sequence: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let maker_spot_account_info = next_account_info(account_info_iter)?;
+        let taker_spot_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+
+        // 验证 Admin
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        // 验证 Maker SpotUserAccount PDA
+        let (maker_spot_pda, _) = Pubkey::find_program_address(
+            &[SPOT_USER_SEED, maker_wallet.as_ref()],
+            program_id,
+        );
+        if maker_spot_account_info.key != &maker_spot_pda {
+            msg!("❌ Invalid Maker PDA: expected {}, got {}", maker_spot_pda, maker_spot_account_info.key);
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 验证 Taker SpotUserAccount PDA
+        let (taker_spot_pda, _) = Pubkey::find_program_address(
+            &[SPOT_USER_SEED, taker_wallet.as_ref()],
+            program_id,
+        );
+        if taker_spot_account_info.key != &taker_spot_pda {
+            msg!("❌ Invalid Taker PDA: expected {}, got {}", taker_spot_pda, taker_spot_account_info.key);
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+
+        // 加载 Maker 和 Taker 账户
+        let mut maker_spot = deserialize_account::<SpotUserAccount>(&maker_spot_account_info.data.borrow())?;
+        let mut taker_spot = deserialize_account::<SpotUserAccount>(&taker_spot_account_info.data.borrow())?;
+
+        // 验证钱包地址
+        if maker_spot.wallet != maker_wallet {
+            msg!("❌ Maker wallet mismatch");
+            return Err(VaultError::UnauthorizedUser.into());
+        }
+        if taker_spot.wallet != taker_wallet {
+            msg!("❌ Taker wallet mismatch");
+            return Err(VaultError::UnauthorizedUser.into());
+        }
+
+        // 检查序列号 (防重放) - 使用 Taker 的 last_settled_sequence
+        if sequence <= taker_spot.last_settled_sequence {
+            msg!("❌ Duplicate settlement: sequence {} <= last_settled_sequence {}", sequence, taker_spot.last_settled_sequence);
+            return Err(VaultError::SettlementFailed.into());
+        }
+
+        // 执行结算
+        if taker_is_buy {
+            // Taker 买入: Taker 用 quote 换 base
+            // Taker: -locked[quote], +available[base]
+            taker_spot.unlock_balance(quote_token_index, quote_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Taker unlock quote failed: {}", e);
+                    VaultError::InsufficientBalance
+                })?;
+            taker_spot.deposit(base_token_index, base_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Taker deposit base failed: {}", e);
+                    VaultError::DepositFailed
+                })?;
+
+            // Maker (卖方): -locked[base], +available[quote]
+            maker_spot.unlock_balance(base_token_index, base_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Maker unlock base failed: {}", e);
+                    VaultError::InsufficientBalance
+                })?;
+            maker_spot.deposit(quote_token_index, quote_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Maker deposit quote failed: {}", e);
+                    VaultError::DepositFailed
+                })?;
+        } else {
+            // Taker 卖出: Taker 用 base 换 quote
+            // Taker: -locked[base], +available[quote]
+            taker_spot.unlock_balance(base_token_index, base_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Taker unlock base failed: {}", e);
+                    VaultError::InsufficientBalance
+                })?;
+            taker_spot.deposit(quote_token_index, quote_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Taker deposit quote failed: {}", e);
+                    VaultError::DepositFailed
+                })?;
+
+            // Maker (买方): -locked[quote], +available[base]
+            maker_spot.unlock_balance(quote_token_index, quote_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Maker unlock quote failed: {}", e);
+                    VaultError::InsufficientBalance
+                })?;
+            maker_spot.deposit(base_token_index, base_amount_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Maker deposit base failed: {}", e);
+                    VaultError::DepositFailed
+                })?;
+        }
+
+        // 更新序列号
+        taker_spot.last_settled_sequence = sequence;
+        maker_spot.last_settled_sequence = sequence;
+
+        // 保存状态
+        maker_spot.serialize(&mut &mut maker_spot_account_info.data.borrow_mut()[..])?;
+        taker_spot.serialize(&mut &mut taker_spot_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ RelayerSpotSettleTrade: maker={}, taker={}, base={}, quote={}, taker_is_buy={}, seq={}", 
+             maker_wallet, taker_wallet, base_amount_e6, quote_amount_e6, taker_is_buy, sequence);
         Ok(())
     }
 }

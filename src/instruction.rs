@@ -447,5 +447,187 @@ pub enum VaultInstruction {
         /// 出金金额 (e6)
         amount: u64,
     },
+
+    // =========================================================================
+    // Spot 交易相关指令 - 使用独立的 SpotUserAccount PDA
+    // =========================================================================
+
+    /// 初始化 Spot 用户账户
+    /// 
+    /// 创建 SpotUserAccount PDA，支持多种 Token 余额管理
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User (payer)
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[]` System Program
+    InitializeSpotUser,
+
+    /// Spot Token 入金 (用户直接调用)
+    /// 
+    /// 将用户的 SPL Token 转入 Vault，增加 SpotUserAccount 余额
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[writable]` User Token Account (SPL Token)
+    /// 3. `[writable]` Vault Token Account (SPL Token)
+    /// 4. `[]` VaultConfig
+    /// 5. `[]` Token Program
+    SpotDeposit {
+        /// Token 索引 (来自 Listing Program TokenRegistry)
+        token_index: u16,
+        /// 入金金额 (e6 或原生精度)
+        amount: u64,
+    },
+
+    /// Spot Token 出金 (用户直接调用)
+    /// 
+    /// 将 Vault 中的 Token 转回给用户
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` User
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[writable]` User Token Account (SPL Token)
+    /// 3. `[writable]` Vault Token Account (SPL Token)
+    /// 4. `[]` VaultConfig
+    /// 5. `[]` Token Program
+    SpotWithdraw {
+        /// Token 索引
+        token_index: u16,
+        /// 出金金额
+        amount: u64,
+    },
+
+    /// Spot 锁定余额 (CPI only - 挂单时)
+    /// 
+    /// 由 Matcher/Gateway 调用，锁定用户余额以防止超卖
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[]` Caller Program (验证白名单)
+    SpotLockBalance {
+        /// Token 索引
+        token_index: u16,
+        /// 锁定金额
+        amount: u64,
+    },
+
+    /// Spot 解锁余额 (CPI only - 撤单时)
+    /// 
+    /// 由 Matcher/Gateway 调用，释放锁定的余额
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[]` Caller Program
+    SpotUnlockBalance {
+        /// Token 索引
+        token_index: u16,
+        /// 解锁金额
+        amount: u64,
+    },
+
+    /// Spot 交易结算 (CPI only - 成交时)
+    /// 
+    /// 由 Relayer/Settlement 调用，执行 Token 余额变动
+    /// 
+    /// 流程 (Buy):
+    /// 1. 从 buyer.locked[quote_token] 扣除 quote_amount
+    /// 2. 增加 buyer.available[base_token] += base_amount
+    /// 
+    /// 流程 (Sell):
+    /// 1. 从 seller.locked[base_token] 扣除 base_amount
+    /// 2. 增加 seller.available[quote_token] += quote_amount
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[]` Caller Program
+    SpotSettleTrade {
+        /// 是否为 Buy 方
+        is_buy: bool,
+        /// Base Token 索引
+        base_token_index: u16,
+        /// Quote Token 索引
+        quote_token_index: u16,
+        /// Base 数量
+        base_amount: u64,
+        /// Quote 数量
+        quote_amount: u64,
+        /// 序列号 (防止重复结算)
+        sequence: u64,
+    },
+
+    /// Relayer 代理 Spot 入金 (Admin/Relayer only)
+    /// 
+    /// 类似 RelayerDeposit，用于跨链 Token 入金
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` SpotUserAccount PDA (会自动创建)
+    /// 2. `[writable]` VaultConfig
+    /// 3. `[]` System Program
+    RelayerSpotDeposit {
+        /// 目标用户钱包地址
+        user_wallet: Pubkey,
+        /// Token 索引
+        token_index: u16,
+        /// 入金金额
+        amount: u64,
+    },
+
+    /// Relayer 代理 Spot 出金 (Admin/Relayer only)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[]` VaultConfig
+    RelayerSpotWithdraw {
+        /// 目标用户钱包地址
+        user_wallet: Pubkey,
+        /// Token 索引
+        token_index: u16,
+        /// 出金金额
+        amount: u64,
+    },
+
+    /// Relayer 代理 Spot 交易结算 (Admin/Relayer only)
+    /// 
+    /// 核心设计：CEX 级体验，用户交易无需签名
+    /// 
+    /// 流程：
+    /// 1. Relayer 收到 Matcher 的 SpotTrade 事件
+    /// 2. Relayer 调用此指令结算双方余额
+    /// 3. Maker: -locked[quote], +available[base] (卖方) 或反之 (买方)
+    /// 4. Taker: +available[quote], -locked[base] (买方) 或反之 (卖方)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` Maker SpotUserAccount PDA
+    /// 2. `[writable]` Taker SpotUserAccount PDA
+    /// 3. `[]` VaultConfig
+    RelayerSpotSettleTrade {
+        /// Maker 钱包地址
+        maker_wallet: Pubkey,
+        /// Taker 钱包地址
+        taker_wallet: Pubkey,
+        /// Base Token 索引 (e.g. BTC = 1)
+        base_token_index: u16,
+        /// Quote Token 索引 (e.g. USDC = 0)
+        quote_token_index: u16,
+        /// Base 数量 (e6 精度)
+        base_amount_e6: i64,
+        /// Quote 数量 (e6 精度)
+        quote_amount_e6: i64,
+        /// Maker 手续费 (e6)
+        maker_fee_e6: i64,
+        /// Taker 手续费 (e6)
+        taker_fee_e6: i64,
+        /// Taker 是否为买方
+        taker_is_buy: bool,
+        /// 序列号 (防重放)
+        sequence: u64,
+    },
 }
 

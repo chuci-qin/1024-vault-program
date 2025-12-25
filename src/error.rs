@@ -68,6 +68,28 @@ pub enum VaultError {
     /// Invalid relayer (not admin or authorized relayer)
     #[error("Invalid relayer")]
     InvalidRelayer,
+
+    // Spot 相关错误
+
+    /// Unauthorized admin
+    #[error("Unauthorized admin")]
+    UnauthorizedAdmin,
+
+    /// Unauthorized user
+    #[error("Unauthorized user")]
+    UnauthorizedUser,
+
+    /// Deposit failed
+    #[error("Deposit failed")]
+    DepositFailed,
+
+    /// Settlement failed
+    #[error("Settlement failed")]
+    SettlementFailed,
+
+    /// Token slots full (max 64)
+    #[error("Token slots full")]
+    TokenSlotsFull,
 }
 
 impl From<VaultError> for ProgramError {

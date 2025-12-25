@@ -316,6 +316,282 @@ impl PredictionMarketUserAccount {
     }
 }
 
+// =============================================================================
+// Spot 交易专用账户 (Phase 2/3: Spot Market Support)
+// =============================================================================
+
+/// SpotUserAccount discriminator
+pub const SPOT_USER_ACCOUNT_DISCRIMINATOR: u64 = 0x53504F545F555352; // "SPOT_USR"
+
+/// SpotUserAccount PDA seed
+pub const SPOT_USER_SEED: &[u8] = b"spot_user";
+
+/// 单个 Token 余额结构 (32 bytes)
+/// token_index (2) + available (8) + locked (8) + reserved (14) = 32 bytes
+pub const TOKEN_BALANCE_SIZE: usize = 32;
+
+/// 最大支持的 Token 数量 (减少到16以避免栈溢出)
+/// 用户若需要更多Token，可使用分页PDA: ["spot_user", wallet, page_index]
+pub const MAX_TOKEN_SLOTS: usize = 16;
+
+/// SpotUserAccount 账户大小 (bytes)
+/// discriminator (8) + wallet (32) + bump (1) + last_settled_sequence (8) + 
+/// token_count (2) + token_balances (16 * 32) + last_update_ts (8) + reserved (64) = 635 bytes
+pub const SPOT_USER_ACCOUNT_SIZE: usize = 8 + 32 + 1 + 8 + 2 + (MAX_TOKEN_SLOTS * TOKEN_BALANCE_SIZE) + 8 + 64;
+
+/// Token 余额结构
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, Default)]
+pub struct TokenBalance {
+    /// Token 索引 (来自 Listing Program TokenRegistry)
+    pub token_index: u16,
+    /// 可用余额 (e6)
+    pub available_e6: i64,
+    /// 挂单锁定余额 (e6)
+    pub locked_e6: i64,
+    /// 预留空间
+    pub reserved: [u8; 14],
+}
+
+impl TokenBalance {
+    /// 判断槽位是否为空 (token_index == 0 且余额都为 0)
+    pub fn is_empty(&self) -> bool {
+        self.token_index == 0 && self.available_e6 == 0 && self.locked_e6 == 0
+    }
+    
+    /// 总余额
+    pub fn total(&self) -> i64 {
+        self.available_e6 + self.locked_e6
+    }
+}
+
+/// Spot 用户账户 (PDA)
+/// Seeds: ["spot_user", wallet.key()]
+/// 
+/// 记录用户持有的多种 Token 余额，用于 Spot 交易
+/// 独立于 Perp 的 UserAccount，避免相互干扰
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct SpotUserAccount {
+    /// 账户类型标识符
+    pub discriminator: u64,
+    
+    /// 用户钱包地址
+    pub wallet: Pubkey,
+    
+    /// PDA bump
+    pub bump: u8,
+    
+    /// 最后结算序列号 (用于并发控制)
+    pub last_settled_sequence: u64,
+    
+    /// 当前已使用的 Token 槽位数量
+    pub token_count: u16,
+    
+    /// Token 余额数组 (最多 64 种)
+    pub token_balances: [TokenBalance; MAX_TOKEN_SLOTS],
+    
+    /// 最后更新时间戳
+    pub last_update_ts: i64,
+    
+    /// 预留字段
+    pub reserved: [u8; 64],
+}
+
+impl SpotUserAccount {
+    pub const DISCRIMINATOR: u64 = SPOT_USER_ACCOUNT_DISCRIMINATOR;
+    
+    /// PDA seeds
+    pub fn seeds(wallet: &Pubkey) -> Vec<Vec<u8>> {
+        vec![
+            SPOT_USER_SEED.to_vec(),
+            wallet.to_bytes().to_vec(),
+        ]
+    }
+    
+    /// 创建新的 Spot 用户账户
+    pub fn new(wallet: Pubkey, bump: u8, created_at: i64) -> Self {
+        Self {
+            discriminator: Self::DISCRIMINATOR,
+            wallet,
+            bump,
+            last_settled_sequence: 0,
+            token_count: 0,
+            token_balances: [TokenBalance::default(); MAX_TOKEN_SLOTS],
+            last_update_ts: created_at,
+            reserved: [0u8; 64],
+        }
+    }
+    
+    /// 查找指定 Token 的余额槽位
+    /// 返回槽位索引，如果不存在返回 None
+    pub fn find_token_slot(&self, token_index: u16) -> Option<usize> {
+        for i in 0..self.token_count as usize {
+            if self.token_balances[i].token_index == token_index {
+                return Some(i);
+            }
+        }
+        None
+    }
+    
+    /// 获取指定 Token 的余额，如果不存在返回 None
+    pub fn get_token_balance(&self, token_index: u16) -> Option<&TokenBalance> {
+        self.find_token_slot(token_index).map(|i| &self.token_balances[i])
+    }
+    
+    /// 获取或创建 Token 余额槽位
+    /// 返回槽位索引，如果槽位已满返回 None
+    pub fn get_or_create_token_slot(&mut self, token_index: u16) -> Option<usize> {
+        // 先查找现有槽位
+        if let Some(slot) = self.find_token_slot(token_index) {
+            return Some(slot);
+        }
+        
+        // 检查是否还有空槽位
+        if self.token_count as usize >= MAX_TOKEN_SLOTS {
+            return None; // 槽位已满
+        }
+        
+        // 创建新槽位
+        let slot = self.token_count as usize;
+        self.token_balances[slot].token_index = token_index;
+        self.token_count += 1;
+        Some(slot)
+    }
+    
+    /// 入金指定 Token
+    pub fn deposit(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
+        if amount <= 0 {
+            return Err("Deposit amount must be positive");
+        }
+        
+        let slot = self.get_or_create_token_slot(token_index)
+            .ok_or("Token slots full")?;
+        
+        self.token_balances[slot].available_e6 = self.token_balances[slot].available_e6
+            .checked_add(amount)
+            .ok_or("Overflow")?;
+        self.last_update_ts = current_ts;
+        Ok(())
+    }
+    
+    /// 出金指定 Token
+    pub fn withdraw(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
+        if amount <= 0 {
+            return Err("Withdraw amount must be positive");
+        }
+        
+        let slot = self.find_token_slot(token_index)
+            .ok_or("Token not found")?;
+        
+        if self.token_balances[slot].available_e6 < amount {
+            return Err("Insufficient balance");
+        }
+        
+        self.token_balances[slot].available_e6 -= amount;
+        self.last_update_ts = current_ts;
+        Ok(())
+    }
+    
+    /// 锁定余额 (挂单时)
+    pub fn lock_balance(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
+        if amount <= 0 {
+            return Err("Lock amount must be positive");
+        }
+        
+        let slot = self.find_token_slot(token_index)
+            .ok_or("Token not found")?;
+        
+        if self.token_balances[slot].available_e6 < amount {
+            return Err("Insufficient balance to lock");
+        }
+        
+        self.token_balances[slot].available_e6 -= amount;
+        self.token_balances[slot].locked_e6 = self.token_balances[slot].locked_e6
+            .checked_add(amount)
+            .ok_or("Overflow")?;
+        self.last_update_ts = current_ts;
+        Ok(())
+    }
+    
+    /// 解锁余额 (撤单时)
+    pub fn unlock_balance(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
+        if amount <= 0 {
+            return Err("Unlock amount must be positive");
+        }
+        
+        let slot = self.find_token_slot(token_index)
+            .ok_or("Token not found")?;
+        
+        if self.token_balances[slot].locked_e6 < amount {
+            return Err("Insufficient locked balance");
+        }
+        
+        self.token_balances[slot].locked_e6 -= amount;
+        self.token_balances[slot].available_e6 = self.token_balances[slot].available_e6
+            .checked_add(amount)
+            .ok_or("Overflow")?;
+        self.last_update_ts = current_ts;
+        Ok(())
+    }
+    
+    /// Spot 交易结算
+    /// 
+    /// Buy 方: base_token 增加, quote_token 减少 (从 locked)
+    /// Sell 方: base_token 减少 (从 locked), quote_token 增加
+    pub fn settle_trade(
+        &mut self,
+        is_buy: bool,
+        base_token_index: u16,
+        quote_token_index: u16,
+        base_amount: i64,
+        quote_amount: i64,
+        sequence: u64,
+        current_ts: i64,
+    ) -> Result<(), &'static str> {
+        // 检查序列号 (防止重复结算)
+        if sequence <= self.last_settled_sequence {
+            return Err("Invalid sequence");
+        }
+        
+        if is_buy {
+            // Buy: 支付 quote_token (从 locked), 获得 base_token
+            let quote_slot = self.find_token_slot(quote_token_index)
+                .ok_or("Quote token not found")?;
+            
+            if self.token_balances[quote_slot].locked_e6 < quote_amount {
+                return Err("Insufficient locked quote balance");
+            }
+            self.token_balances[quote_slot].locked_e6 -= quote_amount;
+            
+            // 增加 base_token
+            let base_slot = self.get_or_create_token_slot(base_token_index)
+                .ok_or("Token slots full")?;
+            self.token_balances[base_slot].available_e6 = self.token_balances[base_slot].available_e6
+                .checked_add(base_amount)
+                .ok_or("Overflow")?;
+        } else {
+            // Sell: 支付 base_token (从 locked), 获得 quote_token
+            let base_slot = self.find_token_slot(base_token_index)
+                .ok_or("Base token not found")?;
+            
+            if self.token_balances[base_slot].locked_e6 < base_amount {
+                return Err("Insufficient locked base balance");
+            }
+            self.token_balances[base_slot].locked_e6 -= base_amount;
+            
+            // 增加 quote_token
+            let quote_slot = self.get_or_create_token_slot(quote_token_index)
+                .ok_or("Token slots full")?;
+            self.token_balances[quote_slot].available_e6 = self.token_balances[quote_slot].available_e6
+                .checked_add(quote_amount)
+                .ok_or("Overflow")?;
+        }
+        
+        self.last_settled_sequence = sequence;
+        self.last_update_ts = current_ts;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
