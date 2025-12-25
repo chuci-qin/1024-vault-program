@@ -2483,8 +2483,8 @@ impl Processor {
         quote_token_index: u16,
         base_amount_e6: i64,
         quote_amount_e6: i64,
-        _maker_fee_e6: i64,
-        _taker_fee_e6: i64,
+        maker_fee_e6: i64,  // ✅ 现在使用：正数=扣费，负数=返佣
+        taker_fee_e6: i64,  // ✅ 现在使用：Taker 手续费
         taker_is_buy: bool,
         sequence: u64,
     ) -> ProgramResult {
@@ -2597,6 +2597,57 @@ impl Processor {
                 })?;
         }
 
+        // =========================================================================
+        // 手续费处理 (2025-12-25 新增)
+        // =========================================================================
+        // 
+        // 手续费从 quote token (通常是 USDC) 扣除
+        // - taker_fee_e6 > 0: 从 Taker 扣除手续费
+        // - maker_fee_e6 > 0: 从 Maker 扣除手续费
+        // - maker_fee_e6 < 0: 给 Maker 返佣 (负费率)
+        //
+        // 注意: 手续费直接从用户的 available 余额扣除 (在结算完成后)
+        // TODO: CPI 调用 Fund Program 记录手续费用于后续分配
+        
+        // Taker 手续费扣除
+        if taker_fee_e6 > 0 {
+            taker_spot.withdraw(quote_token_index, taker_fee_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Taker fee deduction failed: {}", e);
+                    VaultError::InsufficientBalance
+                })?;
+            msg!("  Taker fee deducted: {} (quote token idx={})", taker_fee_e6, quote_token_index);
+        }
+        
+        // Maker 手续费处理
+        if maker_fee_e6 > 0 {
+            // 正费率: 扣除手续费
+            maker_spot.withdraw(quote_token_index, maker_fee_e6, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Maker fee deduction failed: {}", e);
+                    VaultError::InsufficientBalance
+                })?;
+            msg!("  Maker fee deducted: {} (quote token idx={})", maker_fee_e6, quote_token_index);
+        } else if maker_fee_e6 < 0 {
+            // 负费率: 返佣 (增加余额)
+            let rebate = -maker_fee_e6;
+            maker_spot.deposit(quote_token_index, rebate, current_ts)
+                .map_err(|e| {
+                    msg!("❌ Maker rebate failed: {}", e);
+                    VaultError::DepositFailed
+                })?;
+            msg!("  Maker rebate credited: {} (quote token idx={})", rebate, quote_token_index);
+        }
+        
+        // 计算净手续费 (用于统计)
+        let net_fee_e6 = taker_fee_e6 + maker_fee_e6.max(0);
+        if net_fee_e6 > 0 {
+            msg!("  Net trading fee: {} (to be distributed)", net_fee_e6);
+            // TODO: CPI 调用 Fund.CollectSpotTradingFee 记录手续费
+            // 分配比例: 协议60% + 保险基金20% + 返佣系统15% + 做市商奖励5%
+        }
+        
+        // =========================================================================
         // 更新序列号
         taker_spot.last_settled_sequence = sequence;
         maker_spot.last_settled_sequence = sequence;
@@ -2605,8 +2656,8 @@ impl Processor {
         maker_spot.serialize(&mut &mut maker_spot_account_info.data.borrow_mut()[..])?;
         taker_spot.serialize(&mut &mut taker_spot_account_info.data.borrow_mut()[..])?;
 
-        msg!("✅ RelayerSpotSettleTrade: maker={}, taker={}, base={}, quote={}, taker_is_buy={}, seq={}", 
-             maker_wallet, taker_wallet, base_amount_e6, quote_amount_e6, taker_is_buy, sequence);
+        msg!("✅ RelayerSpotSettleTrade: maker={}, taker={}, base={}, quote={}, taker_fee={}, maker_fee={}, seq={}", 
+             maker_wallet, taker_wallet, base_amount_e6, quote_amount_e6, taker_fee_e6, maker_fee_e6, sequence);
         Ok(())
     }
 }
