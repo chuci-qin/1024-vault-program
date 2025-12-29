@@ -629,5 +629,56 @@ pub enum VaultInstruction {
         /// 序列号 (防重放)
         sequence: u64,
     },
+
+    // =========================================================================
+    // Spot 统一账户指令 - 实现 UserAccount ↔ SpotUserAccount USDC 划转
+    // =========================================================================
+
+    /// 从 UserAccount 划转 USDC 到 SpotUserAccount (Relayer/CPI only)
+    /// 
+    /// 用于 Spot 买入前的资金准备，实现统一账户体验：
+    /// - 用户入金到 UserAccount.available_balance
+    /// - Spot 买入时，划转 USDC 到 SpotUserAccount.token_balances[0] (USDC)
+    /// - SpotSettleTrade 可以正常执行
+    /// 
+    /// 流程:
+    /// 1. 从 UserAccount.available_balance 扣除 amount
+    /// 2. 在 SpotUserAccount.token_balances[USDC_INDEX=0].available 增加 amount
+    /// 3. 如果 SpotUserAccount 不存在，自动创建
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[writable]` SpotUserAccount PDA (会自动创建)
+    /// 3. `[]` VaultConfig
+    /// 4. `[]` System Program (用于自动创建账户)
+    SpotAllocateFromVault {
+        /// 目标用户钱包地址
+        user_wallet: Pubkey,
+        /// 划转金额 (e6)
+        amount: u64,
+    },
+
+    /// 从 SpotUserAccount 划转 USDC 到 UserAccount (Relayer/CPI only)
+    /// 
+    /// 用于 Spot 卖出后的资金归还：
+    /// - Spot 卖出获得 USDC 后，划转回 UserAccount.available_balance
+    /// - 实现统一账户体验，资金可以继续用于 Perp 或 Prediction
+    /// 
+    /// 流程:
+    /// 1. 从 SpotUserAccount.token_balances[USDC_INDEX=0].available 扣除 amount
+    /// 2. 在 UserAccount.available_balance 增加 amount
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[writable]` SpotUserAccount PDA
+    /// 3. `[]` VaultConfig
+    SpotReleaseToVault {
+        /// 目标用户钱包地址
+        user_wallet: Pubkey,
+        /// 划转金额 (e6)
+        amount: u64,
+    },
 }
 
