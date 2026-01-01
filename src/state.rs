@@ -590,6 +590,95 @@ impl SpotUserAccount {
         self.last_update_ts = current_ts;
         Ok(())
     }
+    
+    /// Spot 交易结算 V2 (2025-12-31 新增)
+    /// 
+    /// 优先从 available_e6 扣除，符合 Hyperliquid 模式：
+    /// - 链下验证余额
+    /// - 链上只结算，不需要预先锁定
+    /// 
+    /// Buy 方: base_token 增加, quote_token 减少 (从 available - fee)
+    /// Sell 方: base_token 减少 (从 available), quote_token 增加 (- fee)
+    pub fn settle_trade_v2(
+        &mut self,
+        is_buy: bool,
+        base_token_index: u16,
+        quote_token_index: u16,
+        base_amount: i64,
+        quote_amount: i64,
+        fee_e6: i64,
+        sequence: u64,
+        current_ts: i64,
+    ) -> Result<(), &'static str> {
+        // 检查序列号 (防止重复结算)
+        if sequence <= self.last_settled_sequence {
+            return Err("Invalid sequence - already settled");
+        }
+        
+        if is_buy {
+            // Buy: 支付 quote_token + fee, 获得 base_token
+            let quote_slot = self.get_or_create_token_slot(quote_token_index)
+                .ok_or("Token slots full")?;
+            
+            let total_cost = quote_amount + fee_e6;
+            
+            // 优先从 available 扣除，不足则从 locked 扣除
+            let available = self.token_balances[quote_slot].available_e6;
+            let locked = self.token_balances[quote_slot].locked_e6;
+            
+            if available >= total_cost {
+                // 全部从 available 扣除
+                self.token_balances[quote_slot].available_e6 -= total_cost;
+            } else if available + locked >= total_cost {
+                // 先扣 available，不足从 locked 补
+                let from_locked = total_cost - available;
+                self.token_balances[quote_slot].available_e6 = 0;
+                self.token_balances[quote_slot].locked_e6 -= from_locked;
+            } else {
+                return Err("Insufficient quote balance for buy");
+            }
+            
+            // 增加 base_token
+            let base_slot = self.get_or_create_token_slot(base_token_index)
+                .ok_or("Token slots full")?;
+            self.token_balances[base_slot].available_e6 = self.token_balances[base_slot].available_e6
+                .checked_add(base_amount)
+                .ok_or("Overflow")?;
+        } else {
+            // Sell: 支付 base_token, 获得 quote_token - fee
+            let base_slot = self.get_or_create_token_slot(base_token_index)
+                .ok_or("Token slots full")?;
+            
+            // 优先从 available 扣除，不足则从 locked 扣除
+            let available = self.token_balances[base_slot].available_e6;
+            let locked = self.token_balances[base_slot].locked_e6;
+            
+            if available >= base_amount {
+                self.token_balances[base_slot].available_e6 -= base_amount;
+            } else if available + locked >= base_amount {
+                let from_locked = base_amount - available;
+                self.token_balances[base_slot].available_e6 = 0;
+                self.token_balances[base_slot].locked_e6 -= from_locked;
+            } else {
+                return Err("Insufficient base balance for sell");
+            }
+            
+            // 增加 quote_token (扣除手续费)
+            let quote_slot = self.get_or_create_token_slot(quote_token_index)
+                .ok_or("Token slots full")?;
+            let net_quote = quote_amount - fee_e6;
+            if net_quote < 0 {
+                return Err("Fee exceeds quote amount");
+            }
+            self.token_balances[quote_slot].available_e6 = self.token_balances[quote_slot].available_e6
+                .checked_add(net_quote)
+                .ok_or("Overflow")?;
+        }
+        
+        self.last_settled_sequence = sequence;
+        self.last_update_ts = current_ts;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

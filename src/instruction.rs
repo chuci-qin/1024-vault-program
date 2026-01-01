@@ -591,5 +591,75 @@ pub enum VaultInstruction {
         /// 出金金额
         amount: u64,
     },
+
+    // =========================================================================
+    // Spot 统一账户指令 (2025-12-31 新增)
+    // =========================================================================
+
+    /// Relayer 代理 Spot 交易结算 (Admin/Relayer only)
+    /// 
+    /// CEX 级体验：用户交易无需签名，由 Relayer 代理结算
+    /// 同时更新 Maker 和 Taker 两个 SpotUserAccount
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` Maker SpotUserAccount PDA
+    /// 2. `[writable]` Taker SpotUserAccount PDA
+    /// 3. `[]` VaultConfig
+    RelayerSpotSettleTrade {
+        /// Maker 钱包地址
+        maker_wallet: Pubkey,
+        /// Taker 钱包地址
+        taker_wallet: Pubkey,
+        /// Base Token 索引 (e.g., BTC=1)
+        base_token_index: u16,
+        /// Quote Token 索引 (e.g., USDC=0)
+        quote_token_index: u16,
+        /// Base 数量 (e6)
+        base_amount_e6: i64,
+        /// Quote 数量 (e6)
+        quote_amount_e6: i64,
+        /// Maker 手续费 (e6)
+        maker_fee_e6: i64,
+        /// Taker 手续费 (e6)
+        taker_fee_e6: i64,
+        /// Taker 是否为买方
+        taker_is_buy: bool,
+        /// 序列号 (防止重复结算)
+        sequence: u64,
+    },
+
+    /// 从 UserAccount 划转 USDC 到 SpotUserAccount (Admin/Relayer only)
+    /// 
+    /// 统一账户体验：Spot 买入前，将 USDC 从主账户划转到 Spot 账户
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA (seed: ["user", wallet])
+    /// 2. `[writable]` SpotUserAccount PDA (seed: ["spot_user", wallet])
+    /// 3. `[]` VaultConfig
+    /// 4. `[]` System Program (用于自动创建 SpotUserAccount)
+    SpotAllocateFromVault {
+        /// 用户钱包地址
+        user_wallet: Pubkey,
+        /// 划转金额 (e6)
+        amount: u64,
+    },
+
+    /// 从 SpotUserAccount 划转 USDC 到 UserAccount (Admin/Relayer only)
+    /// 
+    /// 统一账户体验：Spot 卖出后，将 USDC 从 Spot 账户划转回主账户
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` SpotUserAccount PDA
+    /// 2. `[writable]` UserAccount PDA
+    /// 3. `[]` VaultConfig
+    SpotReleaseToVault {
+        /// 用户钱包地址
+        user_wallet: Pubkey,
+        /// 划转金额 (e6)
+        amount: u64,
+    },
 }
 
