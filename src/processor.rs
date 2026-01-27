@@ -283,6 +283,53 @@ impl Processor {
                 msg!("Instruction: SpotReleaseToVault");
                 Self::process_spot_release_to_vault(program_id, accounts, user_wallet, amount)
             }
+
+            // =========================================================================
+            // 站内支付相关指令
+            // =========================================================================
+
+            VaultInstruction::RelayerInternalTransfer {
+                from_wallet,
+                to_wallet,
+                amount,
+                fee,
+                transfer_type,
+                reference_hash,
+            } => {
+                msg!("Instruction: RelayerInternalTransfer");
+                Self::process_relayer_internal_transfer(
+                    program_id, accounts, from_wallet, to_wallet, amount, fee, transfer_type, reference_hash
+                )
+            }
+            VaultInstruction::InitRecurringAuth {
+                payer,
+                payee,
+                amount,
+                interval_seconds,
+                max_cycles,
+                registration_fee,
+            } => {
+                msg!("Instruction: InitRecurringAuth");
+                Self::process_init_recurring_auth(
+                    program_id, accounts, payer, payee, amount, interval_seconds, max_cycles, registration_fee
+                )
+            }
+            VaultInstruction::ExecuteRecurringPayment {
+                payer,
+                payee,
+                amount,
+                fee,
+                cycle_count,
+            } => {
+                msg!("Instruction: ExecuteRecurringPayment");
+                Self::process_execute_recurring_payment(
+                    program_id, accounts, payer, payee, amount, fee, cycle_count
+                )
+            }
+            VaultInstruction::CancelRecurringAuth { payer, payee } => {
+                msg!("Instruction: CancelRecurringAuth");
+                Self::process_cancel_recurring_auth(program_id, accounts, payer, payee)
+            }
         }
     }
 
@@ -2701,6 +2748,330 @@ impl Processor {
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
         msg!("✅ SpotReleaseToVault: user={}, amount={}", user_wallet, amount);
+        Ok(())
+    }
+
+    // =========================================================================
+    // 站内支付相关处理函数
+    // =========================================================================
+
+    /// 处理 Relayer 代理内部转账
+    /// 
+    /// 流程:
+    /// 1. 验证 Admin/Relayer 签名
+    /// 2. 加载发送方和接收方 UserAccount
+    /// 3. 验证发送方余额 >= amount + fee
+    /// 4. 扣减: from_account.available_balance -= (amount + fee)
+    /// 5. 增加: to_account.available_balance += amount
+    /// 6. 手续费进入 Insurance Fund (记账)
+    fn process_relayer_internal_transfer(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        from_wallet: Pubkey,
+        to_wallet: Pubkey,
+        amount: u64,
+        fee: u64,
+        transfer_type: u8,
+        reference_hash: [u8; 32],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let from_account_info = next_account_info(account_info_iter)?;
+        let to_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        // 验证 Admin 签名
+        if !admin.is_signer {
+            msg!("Admin must sign the transaction");
+            return Err(VaultError::MissingSignature.into());
+        }
+
+        // 加载 VaultConfig
+        let vault_config: VaultConfig = deserialize_account(&vault_config_info.data.borrow())?;
+
+        // 验证 Admin 权限
+        if vault_config.admin != *admin.key {
+            msg!("Only admin can call RelayerInternalTransfer");
+            return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        // 验证 from UserAccount PDA
+        let (expected_from_pda, from_bump) = Pubkey::find_program_address(
+            &[b"user", from_wallet.as_ref()],
+            program_id,
+        );
+        if from_account_info.key != &expected_from_pda {
+            msg!("Invalid from_account PDA");
+            return Err(VaultError::InvalidUserAccount.into());
+        }
+
+        // 验证 to UserAccount PDA
+        let (expected_to_pda, _to_bump) = Pubkey::find_program_address(
+            &[b"user", to_wallet.as_ref()],
+            program_id,
+        );
+        if to_account_info.key != &expected_to_pda {
+            msg!("Invalid to_account PDA");
+            return Err(VaultError::InvalidUserAccount.into());
+        }
+
+        // 加载并更新 from UserAccount
+        let mut from_account: UserAccount = deserialize_account(&from_account_info.data.borrow())?;
+        let total_deduction = (amount + fee) as i64;
+        
+        if from_account.available_balance_e6 < total_deduction {
+            msg!("Insufficient balance: available={}, required={}", 
+                from_account.available_balance_e6, total_deduction);
+            return Err(VaultError::InsufficientBalance.into());
+        }
+
+        from_account.available_balance_e6 -= total_deduction;
+        from_account.last_update_ts = get_current_timestamp();
+
+        // 序列化 from UserAccount
+        from_account.serialize(&mut &mut from_account_info.data.borrow_mut()[..])?;
+
+        // 加载并更新 to UserAccount
+        let mut to_account: UserAccount = deserialize_account(&to_account_info.data.borrow())?;
+        to_account.available_balance_e6 += amount as i64;
+        to_account.last_update_ts = get_current_timestamp();
+
+        // 序列化 to UserAccount
+        to_account.serialize(&mut &mut to_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ RelayerInternalTransfer: from={}, to={}, amount={}, fee={}, type={}, ref={:?}",
+            from_wallet, to_wallet, amount, fee, transfer_type, &reference_hash[..8]);
+        Ok(())
+    }
+
+    /// 处理初始化定时支付授权
+    fn process_init_recurring_auth(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        payer: Pubkey,
+        payee: Pubkey,
+        amount: u64,
+        interval_seconds: i64,
+        max_cycles: u32,
+        registration_fee: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let payer_account_info = next_account_info(account_info_iter)?;
+        let recurring_auth_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        // 验证 Admin 签名
+        if !admin.is_signer {
+            return Err(VaultError::MissingSignature.into());
+        }
+
+        // 加载 VaultConfig
+        let vault_config: VaultConfig = deserialize_account(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        // 验证 payer UserAccount PDA
+        let (expected_payer_pda, _) = Pubkey::find_program_address(
+            &[b"user", payer.as_ref()],
+            program_id,
+        );
+        if payer_account_info.key != &expected_payer_pda {
+            return Err(VaultError::InvalidUserAccount.into());
+        }
+
+        // 验证 RecurringAuth PDA
+        let (expected_recurring_pda, recurring_bump) = Pubkey::find_program_address(
+            &[RECURRING_AUTH_SEED, payer.as_ref(), payee.as_ref()],
+            program_id,
+        );
+        if recurring_auth_info.key != &expected_recurring_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 扣除注册手续费
+        let mut payer_account: UserAccount = deserialize_account(&payer_account_info.data.borrow())?;
+        if payer_account.available_balance_e6 < registration_fee as i64 {
+            msg!("Insufficient balance for registration fee");
+            return Err(VaultError::InsufficientBalance.into());
+        }
+        payer_account.available_balance_e6 -= registration_fee as i64;
+        payer_account.last_update_ts = get_current_timestamp();
+        payer_account.serialize(&mut &mut payer_account_info.data.borrow_mut()[..])?;
+
+        // 创建 RecurringAuth PDA
+        let rent = Rent::get()?;
+        let space = RECURRING_AUTH_SIZE;
+        let lamports = rent.minimum_balance(space);
+
+        let seeds = &[
+            RECURRING_AUTH_SEED,
+            payer.as_ref(),
+            payee.as_ref(),
+            &[recurring_bump],
+        ];
+
+        invoke_signed(
+            &system_instruction::create_account(
+                admin.key,
+                recurring_auth_info.key,
+                lamports,
+                space as u64,
+                program_id,
+            ),
+            &[admin.clone(), recurring_auth_info.clone(), system_program.clone()],
+            &[seeds],
+        )?;
+
+        // 初始化 RecurringAuth
+        let recurring_auth = RecurringAuth::new(
+            payer,
+            payee,
+            recurring_bump,
+            amount,
+            interval_seconds,
+            max_cycles,
+            get_current_timestamp(),
+        );
+        recurring_auth.serialize(&mut &mut recurring_auth_info.data.borrow_mut()[..])?;
+
+        msg!("✅ InitRecurringAuth: payer={}, payee={}, amount={}, interval={}s, fee={}",
+            payer, payee, amount, interval_seconds, registration_fee);
+        Ok(())
+    }
+
+    /// 处理执行定时支付
+    fn process_execute_recurring_payment(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        payer: Pubkey,
+        payee: Pubkey,
+        amount: u64,
+        fee: u64,
+        cycle_count: u32,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let payer_account_info = next_account_info(account_info_iter)?;
+        let payee_account_info = next_account_info(account_info_iter)?;
+        let recurring_auth_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        // 验证 Admin 签名
+        if !admin.is_signer {
+            return Err(VaultError::MissingSignature.into());
+        }
+
+        let vault_config: VaultConfig = deserialize_account(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        // 验证 PDAs
+        let (expected_payer_pda, _) = Pubkey::find_program_address(
+            &[b"user", payer.as_ref()],
+            program_id,
+        );
+        if payer_account_info.key != &expected_payer_pda {
+            return Err(VaultError::InvalidUserAccount.into());
+        }
+
+        let (expected_payee_pda, _) = Pubkey::find_program_address(
+            &[b"user", payee.as_ref()],
+            program_id,
+        );
+        if payee_account_info.key != &expected_payee_pda {
+            return Err(VaultError::InvalidUserAccount.into());
+        }
+
+        let (expected_recurring_pda, _) = Pubkey::find_program_address(
+            &[RECURRING_AUTH_SEED, payer.as_ref(), payee.as_ref()],
+            program_id,
+        );
+        if recurring_auth_info.key != &expected_recurring_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 加载 RecurringAuth
+        let mut recurring_auth: RecurringAuth = deserialize_account(&recurring_auth_info.data.borrow())?;
+        if !recurring_auth.is_active {
+            msg!("RecurringAuth is not active");
+            return Err(VaultError::RecurringAuthNotActive.into());
+        }
+
+        // 验证 cycle_count
+        if cycle_count != recurring_auth.current_cycles + 1 {
+            msg!("Invalid cycle count: expected {}, got {}", 
+                recurring_auth.current_cycles + 1, cycle_count);
+            return Err(VaultError::InvalidCycleCount.into());
+        }
+
+        // 扣除 payer 余额
+        let mut payer_account: UserAccount = deserialize_account(&payer_account_info.data.borrow())?;
+        let total_deduction = (amount + fee) as i64;
+        
+        if payer_account.available_balance_e6 < total_deduction {
+            return Err(VaultError::InsufficientBalance.into());
+        }
+        payer_account.available_balance_e6 -= total_deduction;
+        payer_account.last_update_ts = get_current_timestamp();
+        payer_account.serialize(&mut &mut payer_account_info.data.borrow_mut()[..])?;
+
+        // 增加 payee 余额
+        let mut payee_account: UserAccount = deserialize_account(&payee_account_info.data.borrow())?;
+        payee_account.available_balance_e6 += amount as i64;
+        payee_account.last_update_ts = get_current_timestamp();
+        payee_account.serialize(&mut &mut payee_account_info.data.borrow_mut()[..])?;
+
+        // 更新 RecurringAuth
+        recurring_auth.execute(get_current_timestamp())
+            .map_err(|_| VaultError::RecurringAuthExecutionFailed)?;
+        recurring_auth.serialize(&mut &mut recurring_auth_info.data.borrow_mut()[..])?;
+
+        msg!("✅ ExecuteRecurringPayment: payer={}, payee={}, amount={}, fee={}, cycle={}",
+            payer, payee, amount, fee, cycle_count);
+        Ok(())
+    }
+
+    /// 处理取消定时支付授权
+    fn process_cancel_recurring_auth(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        payer: Pubkey,
+        payee: Pubkey,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let recurring_auth_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+
+        // 验证 Admin 签名
+        if !admin.is_signer {
+            return Err(VaultError::MissingSignature.into());
+        }
+
+        let vault_config: VaultConfig = deserialize_account(&vault_config_info.data.borrow())?;
+        if vault_config.admin != *admin.key {
+            return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        // 验证 RecurringAuth PDA
+        let (expected_recurring_pda, _) = Pubkey::find_program_address(
+            &[RECURRING_AUTH_SEED, payer.as_ref(), payee.as_ref()],
+            program_id,
+        );
+        if recurring_auth_info.key != &expected_recurring_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 取消授权
+        let mut recurring_auth: RecurringAuth = deserialize_account(&recurring_auth_info.data.borrow())?;
+        recurring_auth.cancel();
+        recurring_auth.serialize(&mut &mut recurring_auth_info.data.borrow_mut()[..])?;
+
+        msg!("✅ CancelRecurringAuth: payer={}, payee={}", payer, payee);
         Ok(())
     }
 }

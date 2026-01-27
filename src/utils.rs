@@ -54,6 +54,28 @@ pub fn checked_sub_u64(a: u64, b: u64) -> Result<u64, ProgramError> {
     a.checked_sub(b).ok_or(VaultError::Overflow.into())
 }
 
+/// 获取当前时间戳
+/// 
+/// 注意: 在 BPF 环境中应使用 Clock sysvar
+/// 这里提供简化实现用于开发
+pub fn get_current_timestamp() -> i64 {
+    #[cfg(target_os = "solana")]
+    {
+        use solana_program::clock::Clock;
+        use solana_program::sysvar::Sysvar;
+        Clock::get().map(|c| c.unix_timestamp).unwrap_or(0)
+    }
+    
+    #[cfg(not(target_os = "solana"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -661,5 +661,108 @@ pub enum VaultInstruction {
         /// 划转金额 (e6)
         amount: u64,
     },
+
+    // =========================================================================
+    // 站内支付相关指令 (2026-01-27 新增)
+    // =========================================================================
+
+    /// Relayer 代理内部转账 (站内支付)
+    /// 
+    /// 用于一次性支付和定时支付，从发送方 Vault 余额转账到接收方
+    /// 同时收取固定手续费 (1 USDC) 进入 InsuranceFund
+    /// 
+    /// 安全性：
+    /// - 仅 Admin/Relayer 可调用
+    /// - 验证发送方有足够余额 (amount + fee)
+    /// - 手续费进入 InsuranceFund
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` From UserAccount PDA
+    /// 2. `[writable]` To UserAccount PDA
+    /// 3. `[]` VaultConfig
+    /// 4. `[writable]` Insurance Fund (接收手续费)
+    RelayerInternalTransfer {
+        /// 发送方钱包地址
+        from_wallet: Pubkey,
+        /// 接收方钱包地址
+        to_wallet: Pubkey,
+        /// 转账金额 (e6)
+        amount: u64,
+        /// 手续费 (e6) = 1_000_000 (1 USDC)
+        fee: u64,
+        /// 转账类型: 0=onetime, 1=recurring, 2=registration
+        transfer_type: u8,
+        /// 业务关联哈希 (用于幂等性)
+        reference_hash: [u8; 32],
+    },
+
+    /// 初始化定时支付授权 PDA (链上存证)
+    /// 
+    /// 创建 RecurringAuth PDA 账户，记录定时支付授权信息
+    /// 同时收取注册手续费 (1 USDC)
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` Payer UserAccount PDA
+    /// 2. `[writable]` RecurringAuth PDA (新建)
+    /// 3. `[]` VaultConfig
+    /// 4. `[writable]` Insurance Fund (接收手续费)
+    /// 5. `[]` System Program
+    InitRecurringAuth {
+        /// 付款方钱包
+        payer: Pubkey,
+        /// 收款方钱包
+        payee: Pubkey,
+        /// 每期金额 (e6)
+        amount: u64,
+        /// 扣款周期 (秒)
+        interval_seconds: i64,
+        /// 最大执行次数 (0=无限)
+        max_cycles: u32,
+        /// 注册手续费 (e6) = 1_000_000 (1 USDC)
+        registration_fee: u64,
+    },
+
+    /// 执行定时支付扣款 (由 Scheduler 调用)
+    /// 
+    /// 从付款方扣除 amount + fee，转给收款方
+    /// 更新 RecurringAuth PDA 的执行次数
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` Payer UserAccount PDA
+    /// 2. `[writable]` Payee UserAccount PDA
+    /// 3. `[writable]` RecurringAuth PDA
+    /// 4. `[]` VaultConfig
+    /// 5. `[writable]` Insurance Fund (接收手续费)
+    ExecuteRecurringPayment {
+        /// 付款方钱包
+        payer: Pubkey,
+        /// 收款方钱包
+        payee: Pubkey,
+        /// 转账金额 (e6)
+        amount: u64,
+        /// 手续费 (e6) = 1_000_000 (1 USDC)
+        fee: u64,
+        /// 当前执行次数
+        cycle_count: u32,
+    },
+
+    /// 取消定时支付授权
+    /// 
+    /// 标记 RecurringAuth PDA 为非激活状态
+    /// 不收取手续费
+    /// 
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` RecurringAuth PDA
+    /// 2. `[]` VaultConfig
+    CancelRecurringAuth {
+        /// 付款方钱包
+        payer: Pubkey,
+        /// 收款方钱包
+        payee: Pubkey,
+    },
 }
 

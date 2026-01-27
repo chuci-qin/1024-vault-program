@@ -681,6 +681,144 @@ impl SpotUserAccount {
     }
 }
 
+// =============================================================================
+// 定时支付授权账户 (2026-01-27 新增 - 站内支付系统)
+// =============================================================================
+
+/// RecurringAuth discriminator
+pub const RECURRING_AUTH_DISCRIMINATOR: u64 = 0x5245435F41555448; // "REC_AUTH"
+
+/// RecurringAuth PDA seed
+pub const RECURRING_AUTH_SEED: &[u8] = b"recurring_auth";
+
+/// RecurringAuth 账户大小 (bytes)
+pub const RECURRING_AUTH_SIZE: usize = 8 + // discriminator
+    32 + // payer
+    32 + // payee
+    1 + // bump
+    8 + // amount_e6
+    8 + // interval_seconds
+    4 + // max_cycles
+    4 + // current_cycles
+    1 + // is_active
+    8 + // created_at
+    8 + // last_executed_at
+    32 + // state_hash
+    64; // reserved
+
+/// 定时支付授权 PDA
+/// Seeds: ["recurring_auth", payer, payee]
+/// 
+/// 记录定时支付授权信息，支持链上存证
+#[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
+pub struct RecurringAuth {
+    /// 账户类型标识符
+    pub discriminator: u64,
+    
+    /// 付款方钱包地址
+    pub payer: Pubkey,
+    
+    /// 收款方钱包地址
+    pub payee: Pubkey,
+    
+    /// PDA bump
+    pub bump: u8,
+    
+    /// 每期扣款金额 (e6)
+    pub amount_e6: u64,
+    
+    /// 扣款周期 (秒)
+    pub interval_seconds: i64,
+    
+    /// 最大执行次数 (0=无限)
+    pub max_cycles: u32,
+    
+    /// 已执行次数
+    pub current_cycles: u32,
+    
+    /// 是否激活
+    pub is_active: bool,
+    
+    /// 创建时间戳
+    pub created_at: i64,
+    
+    /// 最后执行时间戳
+    pub last_executed_at: i64,
+    
+    /// 数据库状态哈希 (存证)
+    pub state_hash: [u8; 32],
+    
+    /// 预留字段
+    pub reserved: [u8; 64],
+}
+
+impl RecurringAuth {
+    pub const DISCRIMINATOR: u64 = RECURRING_AUTH_DISCRIMINATOR;
+    
+    /// PDA seeds
+    pub fn seeds(payer: &Pubkey, payee: &Pubkey) -> Vec<Vec<u8>> {
+        vec![
+            RECURRING_AUTH_SEED.to_vec(),
+            payer.to_bytes().to_vec(),
+            payee.to_bytes().to_vec(),
+        ]
+    }
+    
+    /// 创建新的定时支付授权
+    pub fn new(
+        payer: Pubkey,
+        payee: Pubkey,
+        bump: u8,
+        amount_e6: u64,
+        interval_seconds: i64,
+        max_cycles: u32,
+        created_at: i64,
+    ) -> Self {
+        Self {
+            discriminator: Self::DISCRIMINATOR,
+            payer,
+            payee,
+            bump,
+            amount_e6,
+            interval_seconds,
+            max_cycles,
+            current_cycles: 0,
+            is_active: true,
+            created_at,
+            last_executed_at: 0,
+            state_hash: [0u8; 32],
+            reserved: [0u8; 64],
+        }
+    }
+    
+    /// 执行一次扣款
+    pub fn execute(&mut self, current_ts: i64) -> Result<(), &'static str> {
+        if !self.is_active {
+            return Err("Recurring auth is not active");
+        }
+        
+        self.current_cycles += 1;
+        self.last_executed_at = current_ts;
+        
+        // 检查是否达到最大执行次数
+        if self.max_cycles > 0 && self.current_cycles >= self.max_cycles {
+            self.is_active = false;
+        }
+        
+        Ok(())
+    }
+    
+    /// 取消授权
+    pub fn cancel(&mut self) {
+        self.is_active = false;
+    }
+    
+    /// 更新状态哈希
+    pub fn update_state_hash(&mut self, hash: [u8; 32]) {
+        self.state_hash = hash;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -804,5 +942,91 @@ mod tests {
         // Settle with profit (YES wins, get 100 USDC back - 100 tokens * $1)
         account.prediction_market_settle(50_000_000, 100_000_000, 1002).unwrap();
         assert_eq!(account.prediction_market_realized_pnl_e6, 50_000_000); // +$50 profit
+    }
+
+    // === RecurringAuth Tests ===
+
+    #[test]
+    fn test_recurring_auth_creation() {
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let auth = RecurringAuth::new(payer, payee, 255, 10_000_000, 2592000, 12, 1000);
+        
+        assert_eq!(auth.payer, payer);
+        assert_eq!(auth.payee, payee);
+        assert_eq!(auth.amount_e6, 10_000_000);
+        assert_eq!(auth.interval_seconds, 2592000);
+        assert_eq!(auth.max_cycles, 12);
+        assert_eq!(auth.current_cycles, 0);
+        assert!(auth.is_active);
+    }
+
+    #[test]
+    fn test_recurring_auth_execute() {
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let mut auth = RecurringAuth::new(payer, payee, 255, 10_000_000, 2592000, 3, 1000);
+        
+        // Execute first cycle
+        auth.execute(1001).unwrap();
+        assert_eq!(auth.current_cycles, 1);
+        assert!(auth.is_active);
+        
+        // Execute second cycle
+        auth.execute(1002).unwrap();
+        assert_eq!(auth.current_cycles, 2);
+        assert!(auth.is_active);
+        
+        // Execute third (last) cycle
+        auth.execute(1003).unwrap();
+        assert_eq!(auth.current_cycles, 3);
+        assert!(!auth.is_active); // Auto-deactivated after max_cycles
+    }
+
+    #[test]
+    fn test_recurring_auth_unlimited_cycles() {
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let mut auth = RecurringAuth::new(payer, payee, 255, 10_000_000, 2592000, 0, 1000); // 0 = unlimited
+        
+        // Execute many cycles
+        for i in 1..=100 {
+            auth.execute(1000 + i).unwrap();
+            assert_eq!(auth.current_cycles, i as u32);
+            assert!(auth.is_active); // Still active with unlimited cycles
+        }
+    }
+
+    #[test]
+    fn test_recurring_auth_cancel() {
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let mut auth = RecurringAuth::new(payer, payee, 255, 10_000_000, 2592000, 12, 1000);
+        
+        assert!(auth.is_active);
+        auth.cancel();
+        assert!(!auth.is_active);
+        
+        // Cannot execute after cancel
+        assert!(auth.execute(2000).is_err());
+    }
+
+    #[test]
+    fn test_recurring_auth_seeds() {
+        let payer = Pubkey::new_unique();
+        let payee = Pubkey::new_unique();
+        let seeds = RecurringAuth::seeds(&payer, &payee);
+        
+        assert_eq!(seeds.len(), 3);
+        assert_eq!(seeds[0], RECURRING_AUTH_SEED.to_vec());
+        assert_eq!(seeds[1], payer.to_bytes().to_vec());
+        assert_eq!(seeds[2], payee.to_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_recurring_auth_size() {
+        // Verify size calculation
+        assert!(RECURRING_AUTH_SIZE > 0);
+        println!("RecurringAuth SIZE: {}", RECURRING_AUTH_SIZE);
     }
 }
