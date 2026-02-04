@@ -12,6 +12,7 @@ use crate::{
     error::VaultError,
     instruction::VaultInstruction,
     state::*,
+    token_compat,
     utils::*,
 };
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -191,7 +192,7 @@ impl Processor {
             }
             VaultInstruction::PredictionMarketSettle { locked_amount, settlement_amount } => {
                 msg!("Instruction: PredictionMarketSettle");
-                Self::process_prediction_market_settle(accounts, locked_amount, settlement_amount)
+                Self::process_prediction_market_settle(program_id, accounts, locked_amount, settlement_amount)
             }
             VaultInstruction::PredictionMarketClaimSettlement => {
                 msg!("Instruction: PredictionMarketClaimSettlement");
@@ -474,24 +475,14 @@ impl Processor {
             return Err(VaultError::VaultPaused.into());
         }
 
-        // SPL Token Transfer (用户 → Vault)
-        let transfer_ix = spl_token::instruction::transfer(
-            token_program.key,
-            user_token_account.key,
-            vault_token_account.key,
-            user.key,
-            &[],
+        // SPL Token Transfer (用户 → Vault) - 使用 token_compat 支持 Token-2022
+        token_compat::transfer(
+            token_program,
+            user_token_account,
+            vault_token_account,
+            user,
             amount,
-        )?;
-
-        invoke(
-            &transfer_ix,
-            &[
-                user_token_account.clone(),
-                vault_token_account.clone(),
-                user.clone(),
-                token_program.clone(),
-            ],
+            None, // 用户签名，不需要 PDA seeds
         )?;
 
         // 更新UserAccount
@@ -542,28 +533,17 @@ impl Processor {
         user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
-        // SPL Token Transfer (Vault → 用户) - 使用PDA签名
-        let (vault_config_pda, vault_config_bump) =
+        // SPL Token Transfer (Vault → 用户) - 使用 token_compat 支持 Token-2022
+        let (_vault_config_pda, vault_config_bump) =
             Pubkey::find_program_address(&[b"vault_config"], vault_config_info.owner);
 
-        let transfer_ix = spl_token::instruction::transfer(
-            token_program.key,
-            vault_token_account.key,
-            user_token_account.key,
-            &vault_config_pda,
-            &[],
+        token_compat::transfer(
+            token_program,
+            vault_token_account,
+            user_token_account,
+            vault_config_info,
             amount,
-        )?;
-
-        invoke_signed(
-            &transfer_ix,
-            &[
-                vault_token_account.clone(),
-                user_token_account.clone(),
-                vault_config_info.clone(),
-                token_program.clone(),
-            ],
-            &[&[b"vault_config", &[vault_config_bump]]],
+            Some(&[b"vault_config", &[vault_config_bump]]),
         )?;
 
         msg!("Withdrawn {} e6 for {}", amount, user.key);
@@ -751,24 +731,14 @@ impl Processor {
                 return Err(VaultError::InvalidAccount.into());
             }
             
-            let transfer_ix = spl_token::instruction::transfer(
-                &spl_token::id(),
-                vault_token_account.key,
-                insurance_fund_vault.key,
-                vault_config_info.key, // VaultConfig PDA is the authority
-                &[],
+            // 使用 token_compat 支持 Token-2022 (USDC)
+            token_compat::transfer(
+                token_program,
+                vault_token_account,
+                insurance_fund_vault,
+                vault_config_info,
                 liquidation_penalty,
-            )?;
-            
-            invoke_signed(
-                &transfer_ix,
-                &[
-                    vault_token_account.clone(),
-                    insurance_fund_vault.clone(),
-                    vault_config_info.clone(),
-                    token_program.clone(),
-                ],
-                &[&[b"vault_config", &[bump]]],
+                Some(&[b"vault_config", &[bump]]),
             )?;
             
             msg!(
@@ -1188,7 +1158,18 @@ impl Processor {
     }
 
     /// 预测市场结算 (CPI only)
+    /// 
+    /// 支持自动创建 PMUserAccount (传递可选的 payer, system_program, user_wallet)
+    /// 
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` PMUserAccount PDA (will be auto-created if empty)
+    /// 2. `[]` Caller Program
+    /// 3. `[signer, writable]` Payer (optional, for auto-init)
+    /// 4. `[]` System Program (optional, for auto-init)  
+    /// 5. `[]` User Wallet (optional, for PDA derivation)
     fn process_prediction_market_settle(
+        program_id: &Pubkey,
         accounts: &[AccountInfo],
         locked_amount: u64,
         settlement_amount: u64,
@@ -1197,12 +1178,71 @@ impl Processor {
         let vault_config_info = next_account_info(account_info_iter)?;
         let pm_user_account_info = next_account_info(account_info_iter)?;
         let caller_program = next_account_info(account_info_iter)?;
+        
+        // Optional accounts for auto-init
+        let payer_info = next_account_info(account_info_iter).ok();
+        let system_program_info = next_account_info(account_info_iter).ok();
+        let user_wallet_info = next_account_info(account_info_iter).ok();
 
         assert_writable(pm_user_account_info)?;
 
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
         verify_cpi_caller(&vault_config, caller_program)?;
 
+        // Auto-init PMUserAccount if empty
+        if pm_user_account_info.data_is_empty() {
+            msg!("🔧 PMUserAccount not found, attempting auto-init for settle");
+            
+            let payer = payer_info.ok_or_else(|| {
+                msg!("❌ PMUserAccount not initialized and no payer provided");
+                VaultError::InvalidAccount
+            })?;
+            let system_program = system_program_info.ok_or_else(|| {
+                msg!("❌ PMUserAccount not initialized and no system_program provided");
+                VaultError::InvalidAccount
+            })?;
+            let user_wallet = user_wallet_info.ok_or_else(|| {
+                msg!("❌ PMUserAccount not initialized and no user_wallet provided");
+                VaultError::InvalidAccount
+            })?;
+            
+            // Derive PDA to get bump
+            let (pm_user_pda, bump) = Pubkey::find_program_address(
+                &[PREDICTION_MARKET_USER_SEED, user_wallet.key.as_ref()],
+                program_id,
+            );
+            
+            if pm_user_account_info.key != &pm_user_pda {
+                msg!("❌ Invalid PMUserAccount PDA: expected {}, got {}", pm_user_pda, pm_user_account_info.key);
+                return Err(VaultError::InvalidPda.into());
+            }
+            
+            let rent = Rent::get()?;
+            let space = PREDICTION_MARKET_USER_ACCOUNT_SIZE;
+            let lamports = rent.minimum_balance(space);
+            
+            invoke_signed(
+                &system_instruction::create_account(
+                    payer.key,
+                    pm_user_account_info.key,
+                    lamports,
+                    space as u64,
+                    program_id,
+                ),
+                &[payer.clone(), pm_user_account_info.clone(), system_program.clone()],
+                &[&[PREDICTION_MARKET_USER_SEED, user_wallet.key.as_ref(), &[bump]]],
+            )?;
+            
+            let pm_user_account = PredictionMarketUserAccount::new(
+                *user_wallet.key,
+                bump,
+                solana_program::clock::Clock::get()?.unix_timestamp,
+            );
+            pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+            msg!("✅ PMUserAccount auto-initialized for settle: {}", user_wallet.key);
+        }
+
+        // 正常结算逻辑
         let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
         pm_user_account.prediction_market_settle(
             locked_amount as i64,
@@ -1687,22 +1727,14 @@ impl Processor {
             let vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
             msg!("Transferring fee {} from Vault to PM Fee Vault", fee_amount);
-            invoke_signed(
-                &spl_token::instruction::transfer(
-                    token_program_info.key,
-                    vault_token_account_info.key,
-                    pm_fee_vault_info.key,
-                    vault_config_info.key, // VaultConfig PDA as authority
-                    &[],
-                    fee_amount,
-                )?,
-                &[
-                    vault_token_account_info.clone(),
-                    pm_fee_vault_info.clone(),
-                    vault_config_info.clone(),
-                    token_program_info.clone(),
-                ],
-                &[vault_config_seeds],
+            // 使用 token_compat 支持 Token-2022
+            token_compat::transfer(
+                token_program_info,
+                vault_token_account_info,
+                pm_fee_vault_info,
+                vault_config_info,
+                fee_amount,
+                Some(vault_config_seeds),
             )?;
             
             // 9. 更新 PM Fee Config 统计 (累加 total_minting_fee)
@@ -1835,22 +1867,14 @@ impl Processor {
             let vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
             msg!("Transferring fee {} from Vault to PM Fee Vault", fee_amount);
-            invoke_signed(
-                &spl_token::instruction::transfer(
-                    token_program_info.key,
-                    vault_token_account_info.key,
-                    pm_fee_vault_info.key,
-                    vault_config_info.key,
-                    &[],
-                    fee_amount,
-                )?,
-                &[
-                    vault_token_account_info.clone(),
-                    pm_fee_vault_info.clone(),
-                    vault_config_info.clone(),
-                    token_program_info.clone(),
-                ],
-                &[vault_config_seeds],
+            // 使用 token_compat 支持 Token-2022
+            token_compat::transfer(
+                token_program_info,
+                vault_token_account_info,
+                pm_fee_vault_info,
+                vault_config_info,
+                fee_amount,
+                Some(vault_config_seeds),
             )?;
             
             // 8. 更新 PM Fee Config 统计 (累加 total_redemption_fee)
@@ -1969,22 +1993,14 @@ impl Processor {
             let vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
             msg!("Transferring trading fee {} from Vault to PM Fee Vault", fee_amount);
-            invoke_signed(
-                &spl_token::instruction::transfer(
-                    token_program_info.key,
-                    vault_token_account_info.key,
-                    pm_fee_vault_info.key,
-                    vault_config_info.key,
-                    &[],
-                    fee_amount,
-                )?,
-                &[
-                    vault_token_account_info.clone(),
-                    pm_fee_vault_info.clone(),
-                    vault_config_info.clone(),
-                    token_program_info.clone(),
-                ],
-                &[vault_config_seeds],
+            // 使用 token_compat 支持 Token-2022
+            token_compat::transfer(
+                token_program_info,
+                vault_token_account_info,
+                pm_fee_vault_info,
+                vault_config_info,
+                fee_amount,
+                Some(vault_config_seeds),
             )?;
             
             // 6. 更新 PM Fee Config 统计 (累加 total_trading_fee)
@@ -2109,22 +2125,14 @@ impl Processor {
             // 注意: 结算费从 Vault 转出，因为用户的收益本质上是其他用户的损失
             // 在 Complete Set 机制中，总资金是守恒的
             msg!("Transferring settlement fee {} from Vault to PM Fee Vault", fee_amount);
-            invoke_signed(
-                &spl_token::instruction::transfer(
-                    token_program_info.key,
-                    vault_token_account_info.key,
-                    pm_fee_vault_info.key,
-                    vault_config_info.key,
-                    &[],
-                    fee_amount,
-                )?,
-                &[
-                    vault_token_account_info.clone(),
-                    pm_fee_vault_info.clone(),
-                    vault_config_info.clone(),
-                    token_program_info.clone(),
-                ],
-                &[vault_config_seeds],
+            // 使用 token_compat 支持 Token-2022
+            token_compat::transfer(
+                token_program_info,
+                vault_token_account_info,
+                pm_fee_vault_info,
+                vault_config_info,
+                fee_amount,
+                Some(vault_config_seeds),
             )?;
             
             msg!("✅ Settlement fee {} collected", fee_amount);
@@ -2217,22 +2225,14 @@ impl Processor {
             return Err(VaultError::UnauthorizedUser.into());
         }
 
-        // 执行 Token 转账
-        invoke(
-            &spl_token::instruction::transfer(
-                token_program.key,
-                user_token_account.key,
-                vault_token_account.key,
-                user.key,
-                &[],
-                amount,
-            )?,
-            &[
-                user_token_account.clone(),
-                vault_token_account.clone(),
-                user.clone(),
-                token_program.clone(),
-            ],
+        // 执行 Token 转账 - 使用 token_compat 支持 Token-2022
+        token_compat::transfer(
+            token_program,
+            user_token_account,
+            vault_token_account,
+            user,
+            amount,
+            None, // 用户签名，不需要 PDA seeds
         )?;
 
         // 更新 SpotUserAccount 余额
@@ -2282,23 +2282,14 @@ impl Processor {
             return Err(VaultError::InvalidPda.into());
         }
 
-        // 执行 Token 转账
-        invoke_signed(
-            &spl_token::instruction::transfer(
-                token_program.key,
-                vault_token_account.key,
-                user_token_account.key,
-                vault_config_info.key,
-                &[],
-                amount,
-            )?,
-            &[
-                vault_token_account.clone(),
-                user_token_account.clone(),
-                vault_config_info.clone(),
-                token_program.clone(),
-            ],
-            &[&[b"vault_config", &[vault_config_bump]]],
+        // 执行 Token 转账 - 使用 token_compat 支持 Token-2022
+        token_compat::transfer(
+            token_program,
+            vault_token_account,
+            user_token_account,
+            vault_config_info,
+            amount,
+            Some(&[b"vault_config", &[vault_config_bump]]),
         )?;
 
         spot_user.serialize(&mut &mut spot_user_account_info.data.borrow_mut()[..])?;
