@@ -764,5 +764,21 @@ pub enum VaultInstruction {
         /// 收款方钱包
         payee: Pubkey,
     },
+
+    /// G5 A3: 纯记账余额变动（CPI only — 仅限 Fund Program 调用）
+    ///
+    /// 用于 Fund 手续费分配、管理费收取等场景。
+    /// 替代真实 SPL Token Transfer，实现纯记账模式。
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Caller Program PDA（必须是 Fund Program）
+    /// 1. `[]` VaultConfig（验证 caller 权限）
+    /// 2. `[writable]` UserAccount PDA（目标用户，余额增加）
+    CreditUserBalance {
+        /// 目标用户钱包地址（用于 PDA 验证）
+        user_wallet: Pubkey,
+        /// 增加的金额 (e6)
+        amount: u64,
+    },
 }
 

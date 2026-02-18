@@ -331,6 +331,10 @@ impl Processor {
                 msg!("Instruction: CancelRecurringAuth");
                 Self::process_cancel_recurring_auth(program_id, accounts, payer, payee)
             }
+            VaultInstruction::CreditUserBalance { user_wallet, amount } => {
+                msg!("Instruction: CreditUserBalance");
+                Self::process_credit_user_balance(program_id, accounts, user_wallet, amount)
+            }
         }
     }
 
@@ -731,18 +735,15 @@ impl Processor {
                 return Err(VaultError::InvalidAccount.into());
             }
             
-            // 使用 token_compat 支持 Token-2022 (USDC)
-            token_compat::transfer(
-                token_program,
-                vault_token_account,
-                insurance_fund_vault,
-                vault_config_info,
-                liquidation_penalty,
-                Some(&[b"vault_config", &[bump]]),
-            )?;
+            // G5 A2: 删除真实 USDC 转账（纯记账模式 — 清算罚金仅通过 InsuranceFundConfig 统计追踪）
+            // 原: token_compat::transfer(... vault → insurance_fund_vault ...)
+            msg!("Liquidation penalty {} recorded (pure accounting, no transfer)", liquidation_penalty);
+            let _ = insurance_fund_vault; // suppress unused
+            let _ = token_program;
+            let _ = bump;
             
             msg!(
-                "✅ Liquidation penalty {} transferred to Insurance Fund",
+                "✅ Liquidation penalty {} recorded to Insurance Fund (accounting only)",
                 liquidation_penalty
             );
         }
@@ -1724,18 +1725,13 @@ impl Processor {
                 return Err(VaultError::InvalidPda.into());
             }
             
-            let vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
+            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
-            msg!("Transferring fee {} from Vault to PM Fee Vault", fee_amount);
-            // 使用 token_compat 支持 Token-2022
-            token_compat::transfer(
-                token_program_info,
-                vault_token_account_info,
-                pm_fee_vault_info,
-                vault_config_info,
-                fee_amount,
-                Some(vault_config_seeds),
-            )?;
+            // G5 A1: 删除真实 USDC 转账（纯记账模式 — USDC 留在主金库）
+            // 原: token_compat::transfer(... vault → pm_fee_vault ...)
+            // 手续费仅通过 PDA 统计字段累加追踪
+            msg!("PM fee {} recorded (pure accounting, no transfer)", fee_amount);
+            let _ = pm_fee_vault_info; // suppress unused warning
             
             // 9. 更新 PM Fee Config 统计 (累加 total_minting_fee)
             let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
@@ -1864,18 +1860,11 @@ impl Processor {
                 return Err(VaultError::InvalidPda.into());
             }
             
-            let vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
+            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
-            msg!("Transferring fee {} from Vault to PM Fee Vault", fee_amount);
-            // 使用 token_compat 支持 Token-2022
-            token_compat::transfer(
-                token_program_info,
-                vault_token_account_info,
-                pm_fee_vault_info,
-                vault_config_info,
-                fee_amount,
-                Some(vault_config_seeds),
-            )?;
+            // G5 A1: 删除真实 USDC 转账（纯记账模式）
+            msg!("PM fee {} recorded (pure accounting, no transfer)", fee_amount);
+            let _ = pm_fee_vault_info;
             
             // 8. 更新 PM Fee Config 统计 (累加 total_redemption_fee)
             let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
@@ -1990,18 +1979,11 @@ impl Processor {
                 return Err(VaultError::InvalidPda.into());
             }
             
-            let vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
+            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
-            msg!("Transferring trading fee {} from Vault to PM Fee Vault", fee_amount);
-            // 使用 token_compat 支持 Token-2022
-            token_compat::transfer(
-                token_program_info,
-                vault_token_account_info,
-                pm_fee_vault_info,
-                vault_config_info,
-                fee_amount,
-                Some(vault_config_seeds),
-            )?;
+            // G5 A1: 删除真实 USDC 转账（纯记账模式）
+            msg!("PM trading fee {} recorded (pure accounting, no transfer)", fee_amount);
+            let _ = pm_fee_vault_info;
             
             // 6. 更新 PM Fee Config 统计 (累加 total_trading_fee)
             let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
@@ -2120,22 +2102,26 @@ impl Processor {
                 return Err(VaultError::InvalidPda.into());
             }
             
-            let vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
+            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
-            // 注意: 结算费从 Vault 转出，因为用户的收益本质上是其他用户的损失
-            // 在 Complete Set 机制中，总资金是守恒的
-            msg!("Transferring settlement fee {} from Vault to PM Fee Vault", fee_amount);
-            // 使用 token_compat 支持 Token-2022
-            token_compat::transfer(
-                token_program_info,
-                vault_token_account_info,
-                pm_fee_vault_info,
-                vault_config_info,
-                fee_amount,
-                Some(vault_config_seeds),
-            )?;
+            // G5 A1: 删除真实 USDC 转账（纯记账模式）
+            msg!("PM settlement fee {} recorded (pure accounting, no transfer)", fee_amount);
+            let _ = pm_fee_vault_info;
             
-            msg!("✅ Settlement fee {} collected", fee_amount);
+            // CRITICAL-3 修复：更新 PM Fee Config 统计（settlement 费用计入 trading_fee 统计）
+            const SETTLE_FEE_OFFSET: usize = 73; // 与 TOTAL_TRADING_FEE_OFFSET 相同
+            let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
+            let current_total = i64::from_le_bytes(
+                pm_fee_config_data[SETTLE_FEE_OFFSET..SETTLE_FEE_OFFSET + 8]
+                    .try_into()
+                    .unwrap()
+            );
+            let new_total = current_total.saturating_add(fee_amount as i64);
+            pm_fee_config_data[SETTLE_FEE_OFFSET..SETTLE_FEE_OFFSET + 8]
+                .copy_from_slice(&new_total.to_le_bytes());
+            drop(pm_fee_config_data);
+            
+            msg!("✅ Settlement fee {} collected + PDA stats updated (total_trading_fee: {})", fee_amount, new_total);
         }
 
         msg!("✅ PredictionMarketSettleWithFee completed: locked={}, settlement={}, fee={}, net={}", 
@@ -3063,6 +3049,67 @@ impl Processor {
         recurring_auth.serialize(&mut &mut recurring_auth_info.data.borrow_mut()[..])?;
 
         msg!("✅ CancelRecurringAuth: payer={}, payee={}", payer, payee);
+        Ok(())
+    }
+
+    /// G5 A3: CreditUserBalance — 纯记账余额增加
+    ///
+    /// 仅限 Fund Program 通过 CPI 调用。
+    /// 用于手续费分配、管理费收取等场景，替代真实 SPL Token Transfer。
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Caller Program PDA（Fund Program 签名）
+    /// 1. `[]` VaultConfig（验证 caller 是 Fund Program）
+    /// 2. `[writable]` UserAccount PDA（目标用户）
+    fn process_credit_user_balance(
+        _program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let caller_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+
+        // 1. 验证 caller 签名
+        if !caller_info.is_signer {
+            msg!("❌ CreditUserBalance: caller must sign");
+            return Err(VaultError::MissingSignature.into());
+        }
+
+        // 2. 验证 VaultConfig 并确认 caller 是 Fund Program
+        let vault_config: VaultConfig = deserialize_account(&vault_config_info.data.borrow())?;
+        if vault_config.fund_program != *caller_info.key {
+            msg!("❌ CreditUserBalance: caller {} is not Fund Program {}", 
+                caller_info.key, vault_config.fund_program);
+            return Err(VaultError::UnauthorizedCaller.into());
+        }
+
+        // 3. M2 安全加固：验证 UserAccount PDA 对应 user_wallet
+        assert_writable(user_account_info)?;
+        let (expected_user_pda, _) = Pubkey::find_program_address(
+            &[b"user", user_wallet.as_ref()],
+            _program_id,
+        );
+        if user_account_info.key != &expected_user_pda {
+            msg!("❌ CreditUserBalance: UserAccount PDA mismatch. Expected {} for wallet {}", expected_user_pda, user_wallet);
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // 4. 更新余额
+        let mut user_account: UserAccount = deserialize_account(&user_account_info.data.borrow())?;
+        user_account.available_balance_e6 = checked_add(
+            user_account.available_balance_e6, 
+            amount as i64,
+        )?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!(
+            "✅ CreditUserBalance: wallet={}, amount={}, new_balance={}",
+            user_wallet, amount, user_account.available_balance_e6
+        );
         Ok(())
     }
 }
