@@ -452,27 +452,24 @@ pub enum VaultInstruction {
     // Spot 交易相关指令 - 使用独立的 SpotUserAccount PDA
     // =========================================================================
 
-    /// 初始化 Spot 用户账户
-    /// 
-    /// 创建 SpotUserAccount PDA，支持多种 Token 余额管理
-    /// 
-    /// Accounts:
-    /// 0. `[signer]` User (payer)
-    /// 1. `[writable]` SpotUserAccount PDA
-    /// 2. `[]` System Program
-    InitializeSpotUser,
+    /// [DEPRECATED] InitializeSpotUser — no longer needed.
+    /// SpotTokenBalance PDAs are auto-initialized on first deposit.
+    /// Kept as placeholder to preserve Borsh enum index (27).
+    #[allow(non_camel_case_types)]
+    Deprecated_InitializeSpotUser,
 
     /// Spot Token 入金 (用户直接调用)
     /// 
-    /// 将用户的 SPL Token 转入 Vault，增加 SpotUserAccount 余额
+    /// SPL Token 转入 Vault + 更新 SpotTokenBalance PDA (auto-init)
     /// 
     /// Accounts:
     /// 0. `[signer]` User
-    /// 1. `[writable]` SpotUserAccount PDA
+    /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", user, token_index])
     /// 2. `[writable]` User Token Account (SPL Token)
     /// 3. `[writable]` Vault Token Account (SPL Token)
     /// 4. `[]` VaultConfig
     /// 5. `[]` Token Program
+    /// 6. `[]` System Program (for auto-init)
     SpotDeposit {
         /// Token 索引 (来自 Listing Program TokenRegistry)
         token_index: u16,
@@ -482,11 +479,11 @@ pub enum VaultInstruction {
 
     /// Spot Token 出金 (用户直接调用)
     /// 
-    /// 将 Vault 中的 Token 转回给用户
+    /// Vault 中的 Token 转回给用户 + 更新 SpotTokenBalance PDA
     /// 
     /// Accounts:
     /// 0. `[signer]` User
-    /// 1. `[writable]` SpotUserAccount PDA
+    /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", user, token_index])
     /// 2. `[writable]` User Token Account (SPL Token)
     /// 3. `[writable]` Vault Token Account (SPL Token)
     /// 4. `[]` VaultConfig
@@ -504,7 +501,7 @@ pub enum VaultInstruction {
     /// 
     /// Accounts:
     /// 0. `[]` VaultConfig
-    /// 1. `[writable]` SpotUserAccount PDA
+    /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", wallet, token_index])
     /// 2. `[]` Caller Program (验证白名单)
     SpotLockBalance {
         /// Token 索引
@@ -519,7 +516,7 @@ pub enum VaultInstruction {
     /// 
     /// Accounts:
     /// 0. `[]` VaultConfig
-    /// 1. `[writable]` SpotUserAccount PDA
+    /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", wallet, token_index])
     /// 2. `[]` Caller Program
     SpotUnlockBalance {
         /// Token 索引
@@ -528,46 +525,27 @@ pub enum VaultInstruction {
         amount: u64,
     },
 
-    /// Spot 交易结算 (CPI only - 成交时)
-    /// 
-    /// 由 Relayer/Settlement 调用，执行 Token 余额变动
-    /// 
-    /// 流程 (Buy):
-    /// 1. 从 buyer.locked[quote_token] 扣除 quote_amount
-    /// 2. 增加 buyer.available[base_token] += base_amount
-    /// 
-    /// 流程 (Sell):
-    /// 1. 从 seller.locked[base_token] 扣除 base_amount
-    /// 2. 增加 seller.available[quote_token] += quote_amount
-    /// 
-    /// Accounts:
-    /// 0. `[]` VaultConfig
-    /// 1. `[writable]` SpotUserAccount PDA
-    /// 2. `[]` Caller Program
-    SpotSettleTrade {
-        /// 是否为 Buy 方
-        is_buy: bool,
-        /// Base Token 索引
-        base_token_index: u16,
-        /// Quote Token 索引
-        quote_token_index: u16,
-        /// Base 数量
-        base_amount: u64,
-        /// Quote 数量
-        quote_amount: u64,
-        /// 序列号 (防止重复结算)
-        sequence: u64,
+    /// [DEPRECATED] SpotSettleTrade (CPI-only) — use RelayerSpotSettleTrade instead.
+    /// Kept as placeholder to preserve Borsh enum index (32).
+    #[allow(non_camel_case_types)]
+    Deprecated_SpotSettleTrade {
+        _is_buy: bool,
+        _base_token_index: u16,
+        _quote_token_index: u16,
+        _base_amount: u64,
+        _quote_amount: u64,
+        _sequence: u64,
     },
 
     /// Relayer 代理 Spot 入金 (Admin/Relayer only)
     /// 
-    /// 类似 RelayerDeposit，用于跨链 Token 入金
+    /// 更新 SpotTokenBalance PDA (auto-init if needed)
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
-    /// 1. `[writable]` SpotUserAccount PDA (会自动创建)
-    /// 2. `[writable]` VaultConfig
-    /// 3. `[]` System Program
+    /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", user_wallet, token_index])
+    /// 2. `[]` VaultConfig
+    /// 3. `[]` System Program (for auto-init)
     RelayerSpotDeposit {
         /// 目标用户钱包地址
         user_wallet: Pubkey,
@@ -581,7 +559,7 @@ pub enum VaultInstruction {
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
-    /// 1. `[writable]` SpotUserAccount PDA
+    /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", user_wallet, token_index])
     /// 2. `[]` VaultConfig
     RelayerSpotWithdraw {
         /// 目标用户钱包地址
@@ -598,14 +576,17 @@ pub enum VaultInstruction {
 
     /// Relayer 代理 Spot 交易结算 (Admin/Relayer only)
     /// 
-    /// CEX 级体验：用户交易无需签名，由 Relayer 代理结算
-    /// 同时更新 Maker 和 Taker 两个 SpotUserAccount
+    /// CEX 级体验：操作 4 个 SpotTokenBalance PDAs (maker_base, maker_quote, taker_base, taker_quote)
+    /// 无 SpotUserAccount header，无 last_settled_sequence 链上检查
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
-    /// 1. `[writable]` Maker SpotUserAccount PDA
-    /// 2. `[writable]` Taker SpotUserAccount PDA
-    /// 3. `[]` VaultConfig
+    /// 1. `[writable]` Maker Base SpotTokenBalance PDA
+    /// 2. `[writable]` Maker Quote SpotTokenBalance PDA
+    /// 3. `[writable]` Taker Base SpotTokenBalance PDA
+    /// 4. `[writable]` Taker Quote SpotTokenBalance PDA
+    /// 5. `[]` VaultConfig
+    /// 6. `[]` System Program (for auto-init)
     RelayerSpotSettleTrade {
         /// Maker 钱包地址
         maker_wallet: Pubkey,
@@ -629,16 +610,16 @@ pub enum VaultInstruction {
         sequence: u64,
     },
 
-    /// 从 UserAccount 划转 USDC 到 SpotUserAccount (Admin/Relayer only)
+    /// 从 UserAccount 划转 USDC 到 SpotTokenBalance (Admin/Relayer only)
     /// 
-    /// 统一账户体验：Spot 买入前，将 USDC 从主账户划转到 Spot 账户
+    /// 统一账户体验：Spot 买入前，将 USDC 从 Perp 主账户划转到 Spot USDC 余额
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
     /// 1. `[writable]` UserAccount PDA (seed: ["user", wallet])
-    /// 2. `[writable]` SpotUserAccount PDA (seed: ["spot_user", wallet])
+    /// 2. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", wallet, 0u16]) — USDC
     /// 3. `[]` VaultConfig
-    /// 4. `[]` System Program (用于自动创建 SpotUserAccount)
+    /// 4. `[]` System Program (for auto-init SpotTokenBalance)
     SpotAllocateFromVault {
         /// 用户钱包地址
         user_wallet: Pubkey,
@@ -646,14 +627,14 @@ pub enum VaultInstruction {
         amount: u64,
     },
 
-    /// 从 SpotUserAccount 划转 USDC 到 UserAccount (Admin/Relayer only)
+    /// 从 SpotTokenBalance 划转 USDC 到 UserAccount (Admin/Relayer only)
     /// 
-    /// 统一账户体验：Spot 卖出后，将 USDC 从 Spot 账户划转回主账户
+    /// 统一账户体验：Spot 卖出后，将 USDC 从 Spot 余额划转回 Perp 主账户
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
-    /// 1. `[writable]` SpotUserAccount PDA
-    /// 2. `[writable]` UserAccount PDA
+    /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", wallet, 0u16]) — USDC
+    /// 2. `[writable]` UserAccount PDA (seed: ["user", wallet])
     /// 3. `[]` VaultConfig
     SpotReleaseToVault {
         /// 用户钱包地址
@@ -780,5 +761,32 @@ pub enum VaultInstruction {
         /// 增加的金额 (e6)
         amount: u64,
     },
+
+    /// 预测市场结算直接到可用余额 (CPI only)
+    ///
+    /// 原子性完成: pm_locked -= locked_amount, available += settlement_amount
+    /// 消除 pending_settlement 中间状态，赢利直接入账
+    ///
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount
+    /// 2. `[writable]` PredictionMarketUserAccount
+    /// 3. `[]` Caller Program (authorized caller 验证)
+    PredictionMarketSettleToAvailable {
+        locked_amount: u64,
+        settlement_amount: u64,
+    },
+
+    /// Relayer 代替用户领取历史 pending_settlement (authorized caller)
+    ///
+    /// 纯记账: pending_settlement → available_balance (全部)
+    /// 用于清理升级前遗留的 pending_settlement 数据
+    ///
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount
+    /// 2. `[writable]` PredictionMarketUserAccount
+    /// 3. `[signer]` Relayer (authorized caller)
+    RelayerPredictionMarketClaimSettlement,
 }
 

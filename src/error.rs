@@ -110,6 +110,10 @@ pub enum VaultError {
     /// Recurring auth execution failed
     #[error("Recurring auth execution failed")]
     RecurringAuthExecutionFailed,
+
+    /// Deprecated instruction (no longer supported)
+    #[error("Deprecated instruction")]
+    DeprecatedInstruction,
 }
 
 impl From<VaultError> for ProgramError {

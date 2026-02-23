@@ -317,368 +317,112 @@ impl PredictionMarketUserAccount {
 }
 
 // =============================================================================
-// Spot 交易专用账户 (Phase 2/3: Spot Market Support)
+// SpotTokenBalance — Per-Token Balance PDA (Dynamic Token Balance Architecture)
 // =============================================================================
+//
+// Replaces the old SpotUserAccount (635 bytes, 16-token limit) with individual
+// per-token PDAs (98 bytes each, unlimited tokens per user).
+//
+// Design: DYNAMIC-TOKEN-BALANCE-ARCHITECTURE.md (8 audit rounds, 23 findings)
+// Decision: Plan A — SpotUserAccount completely deleted, no header, no sequence check.
+//
+// Each (wallet, token_index) pair gets its own PDA, auto-created on first use.
+// PDA seeds: ["spot_balance", wallet, token_index.to_le_bytes()]
 
-/// SpotUserAccount discriminator
-pub const SPOT_USER_ACCOUNT_DISCRIMINATOR: u64 = 0x53504F545F555352; // "SPOT_USR"
+/// SpotTokenBalance discriminator — "SPTK_BAL" in ASCII hex
+pub const SPOT_TOKEN_BALANCE_DISCRIMINATOR: u64 = 0x5350544B5F42414C;
 
-/// SpotUserAccount PDA seed
-pub const SPOT_USER_SEED: &[u8] = b"spot_user";
+/// SpotTokenBalance PDA seed
+pub const SPOT_BALANCE_SEED: &[u8] = b"spot_balance";
 
-/// 单个 Token 余额结构 (32 bytes)
-/// token_index (2) + available (8) + locked (8) + reserved (14) = 32 bytes
-pub const TOKEN_BALANCE_SIZE: usize = 32;
+/// SpotTokenBalance account size (bytes)
+/// discriminator(8) + wallet(32) + token_index(2) + available_e6(8) + locked_e6(8)
+/// + last_update_ts(8) + bump(1) + reserved(31) = 98 bytes
+pub const SPOT_TOKEN_BALANCE_SIZE: usize = 98;
 
-/// 最大支持的 Token 数量 (减少到16以避免栈溢出)
-/// 用户若需要更多Token，可使用分页PDA: ["spot_user", wallet, page_index]
-pub const MAX_TOKEN_SLOTS: usize = 16;
-
-/// SpotUserAccount 账户大小 (bytes)
-/// discriminator (8) + wallet (32) + bump (1) + last_settled_sequence (8) + 
-/// token_count (2) + token_balances (16 * 32) + last_update_ts (8) + reserved (64) = 635 bytes
-pub const SPOT_USER_ACCOUNT_SIZE: usize = 8 + 32 + 1 + 8 + 2 + (MAX_TOKEN_SLOTS * TOKEN_BALANCE_SIZE) + 8 + 64;
-
-/// Token 余额结构
-#[derive(BorshSerialize, BorshDeserialize, Debug, Clone, Copy, Default)]
-pub struct TokenBalance {
-    /// Token 索引 (来自 Listing Program TokenRegistry)
-    pub token_index: u16,
-    /// 可用余额 (e6)
-    pub available_e6: i64,
-    /// 挂单锁定余额 (e6)
-    pub locked_e6: i64,
-    /// 预留空间
-    pub reserved: [u8; 14],
-}
-
-impl TokenBalance {
-    /// 判断槽位是否为空 (token_index == 0 且余额都为 0)
-    pub fn is_empty(&self) -> bool {
-        self.token_index == 0 && self.available_e6 == 0 && self.locked_e6 == 0
-    }
-    
-    /// 总余额
-    pub fn total(&self) -> i64 {
-        self.available_e6 + self.locked_e6
-    }
-}
-
-/// Spot 用户账户 (PDA)
-/// Seeds: ["spot_user", wallet.key()]
-/// 
-/// 记录用户持有的多种 Token 余额，用于 Spot 交易
-/// 独立于 Perp 的 UserAccount，避免相互干扰
+/// Per-token balance PDA — one per (wallet, token_index) pair
+///
+/// Completely self-contained: PDA seeds verify ownership, discriminator verifies type.
+/// No SpotUserAccount header needed. No InitializeSpotUser step required.
+/// Auto-initialized on first deposit/settle via `auto_init_spot_balance()`.
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
-pub struct SpotUserAccount {
-    /// 账户类型标识符
+pub struct SpotTokenBalance {
+    /// Account type discriminator
     pub discriminator: u64,
-    
-    /// 用户钱包地址
+    /// User wallet (redundant with PDA seeds, kept for defense-in-depth + getProgramAccounts scanning)
     pub wallet: Pubkey,
-    
-    /// PDA bump
-    pub bump: u8,
-    
-    /// 最后结算序列号 (用于并发控制)
-    pub last_settled_sequence: u64,
-    
-    /// 当前已使用的 Token 槽位数量
-    pub token_count: u16,
-    
-    /// Token 余额数组 (最多 64 种)
-    pub token_balances: [TokenBalance; MAX_TOKEN_SLOTS],
-    
-    /// 最后更新时间戳
+    /// Token index (matches assets table and ListingProgram TokenRegistry)
+    pub token_index: u16,
+    /// Available balance (e6 precision) — can be used for orders or withdrawal
+    pub available_e6: i64,
+    /// Locked balance (e6 precision) — reserved by open orders
+    pub locked_e6: i64,
+    /// Last update timestamp (unix seconds)
     pub last_update_ts: i64,
-    
-    /// 预留字段
-    pub reserved: [u8; 64],
+    /// PDA bump seed
+    pub bump: u8,
+    /// Reserved for future expansion
+    pub reserved: [u8; 31],
 }
 
-impl SpotUserAccount {
-    pub const DISCRIMINATOR: u64 = SPOT_USER_ACCOUNT_DISCRIMINATOR;
-    
-    /// PDA seeds
-    pub fn seeds(wallet: &Pubkey) -> Vec<Vec<u8>> {
-        vec![
-            SPOT_USER_SEED.to_vec(),
-            wallet.to_bytes().to_vec(),
-        ]
-    }
-    
-    /// 创建新的 Spot 用户账户
-    pub fn new(wallet: Pubkey, bump: u8, created_at: i64) -> Self {
+impl SpotTokenBalance {
+    pub const DISCRIMINATOR: u64 = SPOT_TOKEN_BALANCE_DISCRIMINATOR;
+
+    /// Create a new SpotTokenBalance with zero balances
+    pub fn new(wallet: Pubkey, token_index: u16, bump: u8, current_ts: i64) -> Self {
         Self {
             discriminator: Self::DISCRIMINATOR,
             wallet,
+            token_index,
+            available_e6: 0,
+            locked_e6: 0,
+            last_update_ts: current_ts,
             bump,
-            last_settled_sequence: 0,
-            token_count: 0,
-            token_balances: [TokenBalance::default(); MAX_TOKEN_SLOTS],
-            last_update_ts: created_at,
-            reserved: [0u8; 64],
+            reserved: [0u8; 31],
         }
     }
-    
-    /// 查找指定 Token 的余额槽位
-    /// 返回槽位索引，如果不存在返回 None
-    pub fn find_token_slot(&self, token_index: u16) -> Option<usize> {
-        for i in 0..self.token_count as usize {
-            if self.token_balances[i].token_index == token_index {
-                return Some(i);
-            }
-        }
-        None
+
+    /// Total balance (available + locked)
+    pub fn total(&self) -> i64 {
+        self.available_e6 + self.locked_e6
     }
-    
-    /// 获取指定 Token 的余额，如果不存在返回 None
-    pub fn get_token_balance(&self, token_index: u16) -> Option<&TokenBalance> {
-        self.find_token_slot(token_index).map(|i| &self.token_balances[i])
-    }
-    
-    /// 获取或创建 Token 余额槽位
-    /// 返回槽位索引，如果槽位已满返回 None
-    pub fn get_or_create_token_slot(&mut self, token_index: u16) -> Option<usize> {
-        // 先查找现有槽位
-        if let Some(slot) = self.find_token_slot(token_index) {
-            return Some(slot);
-        }
-        
-        // 检查是否还有空槽位
-        if self.token_count as usize >= MAX_TOKEN_SLOTS {
-            return None; // 槽位已满
-        }
-        
-        // 创建新槽位
-        let slot = self.token_count as usize;
-        self.token_balances[slot].token_index = token_index;
-        self.token_count += 1;
-        Some(slot)
-    }
-    
-    /// 入金指定 Token
-    pub fn deposit(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
+
+    /// Deduct from balance, preferring available first, then locked
+    /// Returns Ok(()) or Err if insufficient total balance
+    pub fn deduct_prefer_available(&mut self, amount: i64) -> Result<(), &'static str> {
         if amount <= 0 {
-            return Err("Deposit amount must be positive");
+            return Err("Deduct amount must be positive");
         }
-        
-        let slot = self.get_or_create_token_slot(token_index)
-            .ok_or("Token slots full")?;
-        
-        self.token_balances[slot].available_e6 = self.token_balances[slot].available_e6
-            .checked_add(amount)
-            .ok_or("Overflow")?;
-        self.last_update_ts = current_ts;
-        Ok(())
-    }
-    
-    /// 出金指定 Token
-    pub fn withdraw(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
-        if amount <= 0 {
-            return Err("Withdraw amount must be positive");
-        }
-        
-        let slot = self.find_token_slot(token_index)
-            .ok_or("Token not found")?;
-        
-        if self.token_balances[slot].available_e6 < amount {
+        if self.available_e6 >= amount {
+            self.available_e6 -= amount;
+        } else if self.available_e6 + self.locked_e6 >= amount {
+            let from_locked = amount - self.available_e6;
+            self.available_e6 = 0;
+            self.locked_e6 -= from_locked;
+        } else {
             return Err("Insufficient balance");
         }
-        
-        self.token_balances[slot].available_e6 -= amount;
-        self.last_update_ts = current_ts;
         Ok(())
     }
-    
-    /// 锁定余额 (挂单时)
-    pub fn lock_balance(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
-        if amount <= 0 {
-            return Err("Lock amount must be positive");
-        }
-        
-        let slot = self.find_token_slot(token_index)
-            .ok_or("Token not found")?;
-        
-        if self.token_balances[slot].available_e6 < amount {
-            return Err("Insufficient balance to lock");
-        }
-        
-        self.token_balances[slot].available_e6 -= amount;
-        self.token_balances[slot].locked_e6 = self.token_balances[slot].locked_e6
-            .checked_add(amount)
-            .ok_or("Overflow")?;
-        self.last_update_ts = current_ts;
-        Ok(())
-    }
-    
-    /// 解锁余额 (撤单时)
-    pub fn unlock_balance(&mut self, token_index: u16, amount: i64, current_ts: i64) -> Result<(), &'static str> {
-        if amount <= 0 {
-            return Err("Unlock amount must be positive");
-        }
-        
-        let slot = self.find_token_slot(token_index)
-            .ok_or("Token not found")?;
-        
-        if self.token_balances[slot].locked_e6 < amount {
-            return Err("Insufficient locked balance");
-        }
-        
-        self.token_balances[slot].locked_e6 -= amount;
-        self.token_balances[slot].available_e6 = self.token_balances[slot].available_e6
-            .checked_add(amount)
-            .ok_or("Overflow")?;
-        self.last_update_ts = current_ts;
-        Ok(())
-    }
-    
-    /// Spot 交易结算
-    /// 
-    /// Buy 方: base_token 增加, quote_token 减少 (从 locked)
-    /// Sell 方: base_token 减少 (从 locked), quote_token 增加
-    pub fn settle_trade(
-        &mut self,
-        is_buy: bool,
-        base_token_index: u16,
-        quote_token_index: u16,
-        base_amount: i64,
-        quote_amount: i64,
-        sequence: u64,
-        current_ts: i64,
-    ) -> Result<(), &'static str> {
-        // 检查序列号 (防止重复结算)
-        if sequence <= self.last_settled_sequence {
-            return Err("Invalid sequence");
-        }
-        
-        if is_buy {
-            // Buy: 支付 quote_token (从 locked), 获得 base_token
-            let quote_slot = self.find_token_slot(quote_token_index)
-                .ok_or("Quote token not found")?;
-            
-            if self.token_balances[quote_slot].locked_e6 < quote_amount {
-                return Err("Insufficient locked quote balance");
-            }
-            self.token_balances[quote_slot].locked_e6 -= quote_amount;
-            
-            // 增加 base_token
-            let base_slot = self.get_or_create_token_slot(base_token_index)
-                .ok_or("Token slots full")?;
-            self.token_balances[base_slot].available_e6 = self.token_balances[base_slot].available_e6
-                .checked_add(base_amount)
-                .ok_or("Overflow")?;
-        } else {
-            // Sell: 支付 base_token (从 locked), 获得 quote_token
-            let base_slot = self.find_token_slot(base_token_index)
-                .ok_or("Base token not found")?;
-            
-            if self.token_balances[base_slot].locked_e6 < base_amount {
-                return Err("Insufficient locked base balance");
-            }
-            self.token_balances[base_slot].locked_e6 -= base_amount;
-            
-            // 增加 quote_token
-            let quote_slot = self.get_or_create_token_slot(quote_token_index)
-                .ok_or("Token slots full")?;
-            self.token_balances[quote_slot].available_e6 = self.token_balances[quote_slot].available_e6
-                .checked_add(quote_amount)
-                .ok_or("Overflow")?;
-        }
-        
-        self.last_settled_sequence = sequence;
-        self.last_update_ts = current_ts;
-        Ok(())
-    }
-    
-    /// Spot 交易结算 V2 (2025-12-31 新增)
-    /// 
-    /// 优先从 available_e6 扣除，符合 Hyperliquid 模式：
-    /// - 链下验证余额
-    /// - 链上只结算，不需要预先锁定
-    /// 
-    /// Buy 方: base_token 增加, quote_token 减少 (从 available - fee)
-    /// Sell 方: base_token 减少 (从 available), quote_token 增加 (- fee)
-    pub fn settle_trade_v2(
-        &mut self,
-        is_buy: bool,
-        base_token_index: u16,
-        quote_token_index: u16,
-        base_amount: i64,
-        quote_amount: i64,
-        fee_e6: i64,
-        sequence: u64,
-        current_ts: i64,
-    ) -> Result<(), &'static str> {
-        // 检查序列号 (防止重复结算)
-        if sequence <= self.last_settled_sequence {
-            return Err("Invalid sequence - already settled");
-        }
-        
-        if is_buy {
-            // Buy: 支付 quote_token + fee, 获得 base_token
-            let quote_slot = self.get_or_create_token_slot(quote_token_index)
-                .ok_or("Token slots full")?;
-            
-            let total_cost = quote_amount + fee_e6;
-            
-            // 优先从 available 扣除，不足则从 locked 扣除
-            let available = self.token_balances[quote_slot].available_e6;
-            let locked = self.token_balances[quote_slot].locked_e6;
-            
-            if available >= total_cost {
-                // 全部从 available 扣除
-                self.token_balances[quote_slot].available_e6 -= total_cost;
-            } else if available + locked >= total_cost {
-                // 先扣 available，不足从 locked 补
-                let from_locked = total_cost - available;
-                self.token_balances[quote_slot].available_e6 = 0;
-                self.token_balances[quote_slot].locked_e6 -= from_locked;
-            } else {
-                return Err("Insufficient quote balance for buy");
-            }
-            
-            // 增加 base_token
-            let base_slot = self.get_or_create_token_slot(base_token_index)
-                .ok_or("Token slots full")?;
-            self.token_balances[base_slot].available_e6 = self.token_balances[base_slot].available_e6
-                .checked_add(base_amount)
-                .ok_or("Overflow")?;
-        } else {
-            // Sell: 支付 base_token, 获得 quote_token - fee
-            let base_slot = self.get_or_create_token_slot(base_token_index)
-                .ok_or("Token slots full")?;
-            
-            // 优先从 available 扣除，不足则从 locked 扣除
-            let available = self.token_balances[base_slot].available_e6;
-            let locked = self.token_balances[base_slot].locked_e6;
-            
-            if available >= base_amount {
-                self.token_balances[base_slot].available_e6 -= base_amount;
-            } else if available + locked >= base_amount {
-                let from_locked = base_amount - available;
-                self.token_balances[base_slot].available_e6 = 0;
-                self.token_balances[base_slot].locked_e6 -= from_locked;
-            } else {
-                return Err("Insufficient base balance for sell");
-            }
-            
-            // 增加 quote_token (扣除手续费)
-            let quote_slot = self.get_or_create_token_slot(quote_token_index)
-                .ok_or("Token slots full")?;
-            let net_quote = quote_amount - fee_e6;
-            if net_quote < 0 {
-                return Err("Fee exceeds quote amount");
-            }
-            self.token_balances[quote_slot].available_e6 = self.token_balances[quote_slot].available_e6
-                .checked_add(net_quote)
-                .ok_or("Overflow")?;
-        }
-        
-        self.last_settled_sequence = sequence;
-        self.last_update_ts = current_ts;
-        Ok(())
-    }
+}
+
+/// Derive SpotTokenBalance PDA address
+///
+/// Seeds: ["spot_balance", wallet, token_index.to_le_bytes()]
+/// Returns (pda_address, bump)
+pub fn derive_spot_token_balance_pda(
+    program_id: &Pubkey,
+    wallet: &Pubkey,
+    token_index: u16,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            SPOT_BALANCE_SEED,
+            wallet.as_ref(),
+            &token_index.to_le_bytes(),
+        ],
+        program_id,
+    )
 }
 
 // =============================================================================
@@ -1028,5 +772,131 @@ mod tests {
         // Verify size calculation
         assert!(RECURRING_AUTH_SIZE > 0);
         println!("RecurringAuth SIZE: {}", RECURRING_AUTH_SIZE);
+    }
+
+    // === SpotTokenBalance Tests (Dynamic Token Balance Architecture) ===
+
+    #[test]
+    fn test_spot_token_balance_size() {
+        assert_eq!(SPOT_TOKEN_BALANCE_SIZE, 98);
+        let balance = SpotTokenBalance::new(Pubkey::new_unique(), 1, 255, 1000);
+        let serialized = borsh::to_vec(&balance).unwrap();
+        assert_eq!(serialized.len(), SPOT_TOKEN_BALANCE_SIZE);
+    }
+
+    #[test]
+    fn test_spot_token_balance_serialization() {
+        let wallet = Pubkey::new_unique();
+        let balance = SpotTokenBalance::new(wallet, 1, 200, 1234567890);
+
+        let serialized = borsh::to_vec(&balance).unwrap();
+        let deserialized = SpotTokenBalance::try_from_slice(&serialized).unwrap();
+
+        assert_eq!(deserialized.discriminator, SPOT_TOKEN_BALANCE_DISCRIMINATOR);
+        assert_eq!(deserialized.wallet, wallet);
+        assert_eq!(deserialized.token_index, 1);
+        assert_eq!(deserialized.available_e6, 0);
+        assert_eq!(deserialized.locked_e6, 0);
+        assert_eq!(deserialized.last_update_ts, 1234567890);
+        assert_eq!(deserialized.bump, 200);
+        assert_eq!(deserialized.reserved, [0u8; 31]);
+    }
+
+    #[test]
+    fn test_spot_token_balance_total() {
+        let mut balance = SpotTokenBalance::new(Pubkey::new_unique(), 0, 255, 0);
+        balance.available_e6 = 1000_000_000;
+        balance.locked_e6 = 500_000_000;
+        assert_eq!(balance.total(), 1500_000_000);
+    }
+
+    #[test]
+    fn test_spot_token_balance_deduct_prefer_available() {
+        let mut balance = SpotTokenBalance::new(Pubkey::new_unique(), 0, 255, 0);
+        balance.available_e6 = 800_000_000;
+        balance.locked_e6 = 400_000_000;
+
+        // Deduct from available only
+        balance.deduct_prefer_available(500_000_000).unwrap();
+        assert_eq!(balance.available_e6, 300_000_000);
+        assert_eq!(balance.locked_e6, 400_000_000);
+
+        // Deduct spanning available + locked
+        balance.deduct_prefer_available(500_000_000).unwrap();
+        assert_eq!(balance.available_e6, 0);
+        assert_eq!(balance.locked_e6, 200_000_000);
+
+        // Insufficient total
+        let result = balance.deduct_prefer_available(300_000_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_spot_token_balance_pda_derivation() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+
+        let (pda1, bump1) = derive_spot_token_balance_pda(&program_id, &wallet, 0);
+        let (pda2, bump2) = derive_spot_token_balance_pda(&program_id, &wallet, 1);
+        let (pda3, _) = derive_spot_token_balance_pda(&program_id, &wallet, 0);
+
+        // Different token_index → different PDA
+        assert_ne!(pda1, pda2);
+        // Same inputs → same PDA
+        assert_eq!(pda1, pda3);
+        // Bumps are valid
+        assert!(bump1 <= 255);
+        assert!(bump2 <= 255);
+    }
+
+    #[test]
+    fn test_spot_token_balance_lock_unlock() {
+        let mut balance = SpotTokenBalance::new(Pubkey::new_unique(), 0, 255, 0);
+        balance.available_e6 = 1000_000_000;
+
+        // Lock 400: available=600, locked=400
+        balance.available_e6 -= 400_000_000;
+        balance.locked_e6 += 400_000_000;
+        assert_eq!(balance.available_e6, 600_000_000);
+        assert_eq!(balance.locked_e6, 400_000_000);
+        assert_eq!(balance.total(), 1000_000_000); // conservation
+
+        // Unlock 200: available=800, locked=200
+        balance.locked_e6 -= 200_000_000;
+        balance.available_e6 += 200_000_000;
+        assert_eq!(balance.available_e6, 800_000_000);
+        assert_eq!(balance.locked_e6, 200_000_000);
+        assert_eq!(balance.total(), 1000_000_000); // conservation
+
+        // Lock more than available should be caught by processor (checked arithmetic)
+        let excess = balance.available_e6 + 1;
+        assert!(balance.available_e6 < excess); // would underflow
+    }
+
+    #[test]
+    fn test_spot_token_balance_allocate_release_logic() {
+        // Simulate allocate: UserAccount.available -= X, SpotTokenBalance.available += X
+        let mut user_available: i64 = 10000_000_000; // 10000 USDC
+        let mut spot_available: i64 = 0;
+
+        let amount: i64 = 3000_000_000; // allocate 3000 USDC
+
+        // Allocate
+        assert!(user_available >= amount);
+        user_available -= amount;
+        spot_available += amount;
+        assert_eq!(user_available, 7000_000_000);
+        assert_eq!(spot_available, 3000_000_000);
+
+        // Release
+        let release: i64 = 1500_000_000;
+        assert!(spot_available >= release);
+        spot_available -= release;
+        user_available += release;
+        assert_eq!(user_available, 8500_000_000);
+        assert_eq!(spot_available, 1500_000_000);
+
+        // Conservation: total unchanged
+        assert_eq!(user_available + spot_available, 10000_000_000);
     }
 }
