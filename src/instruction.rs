@@ -788,5 +788,27 @@ pub enum VaultInstruction {
     /// 2. `[writable]` PredictionMarketUserAccount
     /// 3. `[signer]` Relayer (authorized caller)
     RelayerPredictionMarketClaimSettlement,
+
+    /// Relayer 代理出金并转账 (Admin/Relayer only)
+    ///
+    /// 功能：
+    /// 1. 扣除用户 Vault 余额（记账）
+    /// 2. 从 Vault Token Account 转 USDC 到 Relayer Token Account
+    ///
+    /// 用途：跨链桥出金 — Relayer 从 Vault 提取 USDC 后调用 Bridge.stake 跨链
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` VaultConfig
+    /// 3. `[writable]` Vault Token Account
+    /// 4. `[writable]` Relayer Token Account (接收方)
+    /// 5. `[]` Token Program
+    RelayerWithdrawAndTransfer {
+        /// 目标用户钱包地址
+        user_wallet: Pubkey,
+        /// 出金金额 (e6)
+        amount: u64,
+    },
 }
 

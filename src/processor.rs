@@ -344,6 +344,10 @@ impl Processor {
                 msg!("Instruction: RelayerPredictionMarketClaimSettlement");
                 Self::process_relayer_prediction_market_claim_settlement(accounts)
             }
+            VaultInstruction::RelayerWithdrawAndTransfer { user_wallet, amount } => {
+                msg!("Instruction: RelayerWithdrawAndTransfer");
+                Self::process_relayer_withdraw_and_transfer(program_id, accounts, user_wallet, amount)
+            }
         }
     }
 
@@ -1652,6 +1656,108 @@ impl Processor {
         msg!("✅ RelayerWithdraw {} e6 for {} (remaining: {})", 
             amount, user_wallet, user_account.available_balance_e6);
         
+        Ok(())
+    }
+
+    /// Relayer 代理出金并转账
+    ///
+    /// 功能：
+    /// 1. 验证 Admin 签名
+    /// 2. 扣除用户 Vault 余额
+    /// 3. 从 Vault Token Account 转 USDC 到 Relayer Token Account
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` VaultConfig
+    /// 3. `[writable]` Vault Token Account
+    /// 4. `[writable]` Relayer Token Account
+    /// 5. `[]` Token Program
+    fn process_relayer_withdraw_and_transfer(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let vault_token_account = next_account_info(account_info_iter)?;
+        let relayer_token_account = next_account_info(account_info_iter)?;
+        let token_program = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+        assert_writable(user_account_info)?;
+        assert_writable(vault_token_account)?;
+        assert_writable(relayer_token_account)?;
+
+        let vault_config_data = vault_config_info.data.borrow();
+        if vault_config_data.len() < 40 {
+            msg!("❌ Invalid VaultConfig data length: {}", vault_config_data.len());
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        let stored_admin = Pubkey::try_from(&vault_config_data[8..40])
+            .map_err(|_| VaultError::InvalidAccount)?;
+
+        if stored_admin != *admin.key {
+            msg!("❌ Invalid relayer: {} (expected admin: {})", admin.key, stored_admin);
+            return Err(VaultError::InvalidRelayer.into());
+        }
+
+        drop(vault_config_data);
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        let (user_account_pda, _bump) = Pubkey::find_program_address(
+            &[b"user", user_wallet.as_ref()],
+            program_id
+        );
+        if user_account_info.key != &user_account_pda {
+            msg!("❌ Invalid UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        if user_account_info.data_is_empty() {
+            msg!("❌ UserAccount does not exist for {}", user_wallet);
+            return Err(VaultError::NotInitialized.into());
+        }
+
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+
+        if user_account.wallet != user_wallet {
+            msg!("❌ Wallet mismatch: expected {}, got {}", user_wallet, user_account.wallet);
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        if user_account.available_balance_e6 < amount as i64 {
+            msg!("❌ Insufficient balance: {} < {}", user_account.available_balance_e6, amount);
+            return Err(VaultError::InsufficientBalance.into());
+        }
+
+        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
+        user_account.total_withdrawn_e6 = checked_add(user_account.total_withdrawn_e6, amount as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        let (_vault_config_pda, vault_config_bump) =
+            Pubkey::find_program_address(&[b"vault_config"], program_id);
+
+        token_compat::transfer(
+            token_program,
+            vault_token_account,
+            relayer_token_account,
+            vault_config_info,
+            amount,
+            Some(&[b"vault_config", &[vault_config_bump]]),
+        )?;
+
+        msg!("✅ RelayerWithdrawAndTransfer {} e6 for {} → relayer {} (remaining: {})",
+            amount, user_wallet, admin.key, user_account.available_balance_e6);
+
         Ok(())
     }
 
