@@ -357,9 +357,9 @@ impl Processor {
                 msg!("Instruction: SpotUnlockUsdc");
                 Self::process_spot_unlock_usdc(accounts, amount)
             }
-            VaultInstruction::SpotSettleUsdcTrade { buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence } => {
+            VaultInstruction::SpotSettleUsdcTrade { buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index } => {
                 msg!("Instruction: SpotSettleUsdcTrade");
-                Self::process_spot_settle_usdc_trade(program_id, accounts, buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence)
+                Self::process_spot_settle_usdc_trade(program_id, accounts, buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index)
             }
         }
     }
@@ -2551,6 +2551,11 @@ impl Processor {
         token_index: u16,
         amount: u64,
     ) -> ProgramResult {
+        if token_index == 0 {
+            msg!("❌ USDC (token_index=0) cannot use SpotLockBalance. Use SpotLockUsdc instead.");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let balance_pda_info = next_account_info(account_info_iter)?;
@@ -2579,6 +2584,11 @@ impl Processor {
         token_index: u16,
         amount: u64,
     ) -> ProgramResult {
+        if token_index == 0 {
+            msg!("❌ USDC (token_index=0) cannot use SpotUnlockBalance. Use SpotUnlockUsdc instead.");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let balance_pda_info = next_account_info(account_info_iter)?;
@@ -2726,6 +2736,16 @@ impl Processor {
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
         if vault_config.admin != *admin.key {
             return Err(VaultError::UnauthorizedAdmin.into());
+        }
+
+        if quote_token_index == 0 {
+            msg!("❌ USDC (quote_token_index=0) must use SpotSettleUsdcTrade, not RelayerSpotSettleTrade");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+
+        if base_token_index == 0 {
+            msg!("❌ USDC (base_token_index=0) cannot be a base asset in Spot trades");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
         }
 
         let maker_base_bump = Self::verify_spot_balance_pda(maker_base_info, program_id, &maker_wallet, base_token_index)?;
@@ -3266,6 +3286,11 @@ impl Processor {
     /// 与 LockMargin (Perp) 完全对称。
     /// Accounts: VaultConfig + UserAccount(w) + CallerProgram
     fn process_spot_lock_usdc(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+        if amount > i64::MAX as u64 {
+            msg!("❌ SpotLockUsdc: amount {} exceeds i64::MAX", amount);
+            return Err(VaultError::Overflow.into());
+        }
+
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
@@ -3305,6 +3330,11 @@ impl Processor {
     /// 与 ReleaseMargin (Perp) 完全对称。用于撤单或回滚。
     /// Accounts: VaultConfig + UserAccount(w) + CallerProgram
     fn process_spot_unlock_usdc(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+        if amount > i64::MAX as u64 {
+            msg!("❌ SpotUnlockUsdc: amount {} exceeds i64::MAX", amount);
+            return Err(VaultError::Overflow.into());
+        }
+
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
@@ -3354,7 +3384,20 @@ impl Processor {
         seller_fee: u64,
         base_amount: u64,
         sequence: u64,
+        base_token_index: u16,
     ) -> ProgramResult {
+        if buyer_usdc > i64::MAX as u64 || seller_credit > i64::MAX as u64
+            || buyer_fee > i64::MAX as u64 || seller_fee > i64::MAX as u64
+            || base_amount > i64::MAX as u64 {
+            msg!("❌ SpotSettleUsdcTrade: amount exceeds i64::MAX");
+            return Err(VaultError::Overflow.into());
+        }
+
+        if base_token_index == 0 {
+            msg!("❌ SpotSettleUsdcTrade: USDC (base_token_index=0) cannot be a base asset");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let buyer_account_info = next_account_info(account_info_iter)?;
@@ -3398,11 +3441,19 @@ impl Processor {
             user.last_update_ts = current_ts;
             user.serialize(&mut &mut buyer_account_info.data.borrow_mut()[..])?;
             
-            // Base token: self-trade net = 0, only deduct fees from quote
-            // No base token PDA changes needed
+            // Base token: self-trade — total unchanged, but must migrate locked → available
+            if base_amount > 0 {
+                let mut base = deserialize_account::<SpotTokenBalance>(&buyer_base_info.data.borrow())?;
+                if base.locked_e6 >= base_amount as i64 {
+                    base.locked_e6 = checked_sub(base.locked_e6, base_amount as i64)?;
+                    base.available_e6 = checked_add(base.available_e6, base_amount as i64)?;
+                    base.last_update_ts = current_ts;
+                    base.serialize(&mut &mut buyer_base_info.data.borrow_mut()[..])?;
+                }
+            }
             
-            msg!("✅ SpotSettleUsdcTrade (self-trade): seq={}, usdc_fee={}, wallet={}",
-                sequence, buyer_fee + seller_fee, user.wallet);
+            msg!("✅ SpotSettleUsdcTrade (self-trade): seq={}, usdc_fee={}, base_migrated={}, wallet={}",
+                sequence, buyer_fee + seller_fee, base_amount, user.wallet);
         } else {
             // --- 非自交：分别更新 buyer 和 seller ---
             
@@ -3427,6 +3478,15 @@ impl Processor {
 
             // Buyer base token: available += base_amount (auto-init if needed)
             let buyer_wallet = buyer.wallet;
+            if buyer_base_info.data_is_empty() {
+                let buyer_base_bump = Self::verify_spot_balance_pda(
+                    buyer_base_info, program_id, &buyer_wallet, base_token_index
+                )?;
+                Self::auto_init_spot_balance(
+                    caller_program, buyer_base_info, system_program, program_id,
+                    &buyer_wallet, base_token_index, buyer_base_bump,
+                )?;
+            }
             let mut buyer_base = deserialize_account::<SpotTokenBalance>(&buyer_base_info.data.borrow())?;
             buyer_base.available_e6 = checked_add(buyer_base.available_e6, base_amount as i64)?;
             buyer_base.last_update_ts = current_ts;

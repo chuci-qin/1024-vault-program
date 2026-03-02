@@ -869,6 +869,8 @@ pub enum VaultInstruction {
         base_amount: u64,
         /// 交易序号 (幂等性 / 去重)
         sequence: u64,
+        /// Base token 索引 (e.g., BTC=1), 用于 auto-init buyer base PDA
+        base_token_index: u16,
     },
 }
 

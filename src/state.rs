@@ -43,7 +43,8 @@ pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
     8 + // total_deposited_e6
     8 + // total_withdrawn_e6
     8 + // last_update_ts
-    64; // reserved
+    8 + // spot_locked_e6 (One Account Experience)
+    56; // reserved (was 64, reduced by 8 for spot_locked_e6)
 
 /// Vault 全局配置
 /// 
