@@ -348,6 +348,19 @@ impl Processor {
                 msg!("Instruction: RelayerWithdrawAndTransfer");
                 Self::process_relayer_withdraw_and_transfer(program_id, accounts, user_wallet, amount)
             }
+            // One Account Experience — Spot USDC 统一管理
+            VaultInstruction::SpotLockUsdc { amount } => {
+                msg!("Instruction: SpotLockUsdc");
+                Self::process_spot_lock_usdc(accounts, amount)
+            }
+            VaultInstruction::SpotUnlockUsdc { amount } => {
+                msg!("Instruction: SpotUnlockUsdc");
+                Self::process_spot_unlock_usdc(accounts, amount)
+            }
+            VaultInstruction::SpotSettleUsdcTrade { buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence } => {
+                msg!("Instruction: SpotSettleUsdcTrade");
+                Self::process_spot_settle_usdc_trade(program_id, accounts, buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence)
+            }
         }
     }
 
@@ -460,7 +473,8 @@ impl Processor {
             total_deposited_e6: 0,
             total_withdrawn_e6: 0,
             last_update_ts: 0,
-            reserved: [0; 64],
+            spot_locked_e6: 0,
+            reserved: [0; 56],
         };
 
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
@@ -1541,7 +1555,8 @@ impl Processor {
                 total_deposited_e6: amount as i64,
                 total_withdrawn_e6: 0,
                 last_update_ts: solana_program::clock::Clock::get()?.unix_timestamp,
-                reserved: [0; 64],
+                spot_locked_e6: 0,
+                reserved: [0; 56],
             };
             user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
@@ -2444,6 +2459,12 @@ impl Processor {
         token_index: u16,
         amount: u64,
     ) -> ProgramResult {
+        // One Account Experience: USDC 必须通过 Vault.Deposit，不能通过 SpotDeposit
+        if token_index == 0 {
+            msg!("❌ USDC (token_index=0) must use Vault.Deposit, not SpotDeposit. Use Vault instruction #2.");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+        
         let account_info_iter = &mut accounts.iter();
         let user = next_account_info(account_info_iter)?;
         let balance_pda_info = next_account_info(account_info_iter)?;
@@ -2481,6 +2502,12 @@ impl Processor {
         token_index: u16,
         amount: u64,
     ) -> ProgramResult {
+        // One Account Experience: USDC 必须通过 Vault.Withdraw，不能通过 SpotWithdraw
+        if token_index == 0 {
+            msg!("❌ USDC (token_index=0) must use Vault.Withdraw, not SpotWithdraw. Use Vault instruction #3.");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+        
         let account_info_iter = &mut accounts.iter();
         let user = next_account_info(account_info_iter)?;
         let balance_pda_info = next_account_info(account_info_iter)?;
@@ -2596,6 +2623,12 @@ impl Processor {
         token_index: u16,
         amount: u64,
     ) -> ProgramResult {
+        // One Account Experience: USDC 必须通过 RelayerDeposit，不能通过 RelayerSpotDeposit
+        if token_index == 0 {
+            msg!("❌ USDC (token_index=0) must use RelayerDeposit (#25), not RelayerSpotDeposit.");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+        
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
         let balance_pda_info = next_account_info(account_info_iter)?;
@@ -2630,6 +2663,12 @@ impl Processor {
         token_index: u16,
         amount: u64,
     ) -> ProgramResult {
+        // One Account Experience: USDC 必须通过 RelayerWithdraw，不能通过 RelayerSpotWithdraw
+        if token_index == 0 {
+            msg!("❌ USDC (token_index=0) must use RelayerWithdraw (#26), not RelayerSpotWithdraw.");
+            return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+        
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
         let balance_pda_info = next_account_info(account_info_iter)?;
@@ -2803,103 +2842,34 @@ impl Processor {
         Ok(())
     }
 
-    /// 从 UserAccount 划转 USDC 到 SpotTokenBalance
-    /// Accounts: admin(signer) + user_account(w) + usdc_balance_pda(w) + vault_config + system_program
+    /// [DEPRECATED] 从 UserAccount 划转 USDC 到 SpotTokenBalance
+    /// 
+    /// One Account Experience: 此指令已废弃。
+    /// USDC 现在通过 SpotLockUsdc/SpotUnlockUsdc 在 UserAccount 内部管理。
+    /// 不再需要将 USDC 搬运到 SpotTokenBalance PDA。
     fn process_spot_allocate_from_vault(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        user_wallet: Pubkey,
-        amount: u64,
+        _program_id: &Pubkey,
+        _accounts: &[AccountInfo],
+        _user_wallet: Pubkey,
+        _amount: u64,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let admin = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let usdc_balance_info = next_account_info(account_info_iter)?;
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let system_program = next_account_info(account_info_iter)?;
-
-        assert_signer(admin)?;
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        if vault_config.admin != *admin.key {
-            return Err(VaultError::UnauthorizedAdmin.into());
-        }
-
-        let (user_pda, _) = Pubkey::find_program_address(&[b"user", user_wallet.as_ref()], program_id);
-        if user_account_info.key != &user_pda {
-            msg!("❌ Invalid UserAccount PDA");
-            return Err(VaultError::InvalidPda.into());
-        }
-
-        let usdc_bump = Self::verify_spot_balance_pda(usdc_balance_info, program_id, &user_wallet, 0)?;
-
-        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        if user_account.available_balance_e6 < amount as i64 {
-            msg!("❌ Insufficient UserAccount balance: available={}, required={}", user_account.available_balance_e6, amount);
-            return Err(VaultError::InsufficientBalance.into());
-        }
-        user_account.available_balance_e6 -= amount as i64;
-        user_account.last_update_ts = current_ts;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        let mut usdc_balance = Self::auto_init_spot_balance(
-            admin, usdc_balance_info, system_program, program_id, &user_wallet, 0, usdc_bump,
-        )?;
-        usdc_balance.available_e6 = usdc_balance.available_e6.checked_add(amount as i64).ok_or(VaultError::Overflow)?;
-        usdc_balance.last_update_ts = current_ts;
-        usdc_balance.serialize(&mut &mut usdc_balance_info.data.borrow_mut()[..])?;
-
-        msg!("✅ SpotAllocateFromVault: user={}, amount={}", user_wallet, amount);
-        Ok(())
+        msg!("❌ SpotAllocateFromVault is deprecated. Use SpotLockUsdc instead (One Account Experience).");
+        Err(VaultError::DeprecatedInstruction.into())
     }
 
-    /// 从 SpotTokenBalance 划转 USDC 到 UserAccount
-    /// Accounts: admin(signer) + usdc_balance_pda(w) + user_account(w) + vault_config
+    /// [DEPRECATED] 从 SpotTokenBalance 划转 USDC 到 UserAccount
+    /// 
+    /// One Account Experience: 此指令已废弃。
+    /// USDC 现在通过 SpotLockUsdc/SpotUnlockUsdc 在 UserAccount 内部管理。
+    /// Spot 卖出获得的 USDC 直接 credit 到 seller 的 UserAccount.available。
     fn process_spot_release_to_vault(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        user_wallet: Pubkey,
-        amount: u64,
+        _program_id: &Pubkey,
+        _accounts: &[AccountInfo],
+        _user_wallet: Pubkey,
+        _amount: u64,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let admin = next_account_info(account_info_iter)?;
-        let usdc_balance_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let vault_config_info = next_account_info(account_info_iter)?;
-
-        assert_signer(admin)?;
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        if vault_config.admin != *admin.key {
-            return Err(VaultError::UnauthorizedAdmin.into());
-        }
-
-        Self::verify_spot_balance_pda(usdc_balance_info, program_id, &user_wallet, 0)?;
-
-        let (user_pda, _) = Pubkey::find_program_address(&[b"user", user_wallet.as_ref()], program_id);
-        if user_account_info.key != &user_pda {
-            msg!("❌ Invalid UserAccount PDA");
-            return Err(VaultError::InvalidPda.into());
-        }
-
-        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-
-        let mut usdc_balance = deserialize_account::<SpotTokenBalance>(&usdc_balance_info.data.borrow())?;
-        if usdc_balance.available_e6 < amount as i64 {
-            msg!("❌ Insufficient SpotTokenBalance(USDC): available={}, required={}", usdc_balance.available_e6, amount);
-            return Err(VaultError::InsufficientBalance.into());
-        }
-        usdc_balance.available_e6 -= amount as i64;
-        usdc_balance.last_update_ts = current_ts;
-        usdc_balance.serialize(&mut &mut usdc_balance_info.data.borrow_mut()[..])?;
-
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        user_account.available_balance_e6 = user_account.available_balance_e6.checked_add(amount as i64).ok_or(VaultError::Overflow)?;
-        user_account.last_update_ts = current_ts;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        msg!("✅ SpotReleaseToVault: user={}, amount={}", user_wallet, amount);
-        Ok(())
+        msg!("❌ SpotReleaseToVault is deprecated. USDC now stays in UserAccount (One Account Experience).");
+        Err(VaultError::DeprecatedInstruction.into())
     }
 
     // =========================================================================
@@ -3284,6 +3254,199 @@ impl Processor {
             "✅ CreditUserBalance: wallet={}, amount={}, new_balance={}",
             user_wallet, amount, user_account.available_balance_e6
         );
+        Ok(())
+    }
+
+    // =========================================================================
+    // One Account Experience — Spot USDC 统一管理
+    // =========================================================================
+
+    /// SpotLockUsdc — 将 USDC 从 available 移到 spot_locked（同一 PDA 内）
+    /// 
+    /// 与 LockMargin (Perp) 完全对称。
+    /// Accounts: VaultConfig + UserAccount(w) + CallerProgram
+    fn process_spot_lock_usdc(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        assert_writable(user_account_info)?;
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.is_paused {
+            return Err(VaultError::VaultPaused.into());
+        }
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        
+        if user_account.available_balance_e6 < amount as i64 {
+            msg!("❌ SpotLockUsdc: insufficient available={}, required={}", 
+                user_account.available_balance_e6, amount);
+            return Err(VaultError::InsufficientBalance.into());
+        }
+
+        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
+        user_account.spot_locked_e6 = checked_add(user_account.spot_locked_e6, amount as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotLockUsdc: {} e6 locked for {}", amount, user_account.wallet);
+        Ok(())
+    }
+
+    /// SpotUnlockUsdc — 将 USDC 从 spot_locked 移回 available
+    /// 
+    /// 与 ReleaseMargin (Perp) 完全对称。用于撤单或回滚。
+    /// Accounts: VaultConfig + UserAccount(w) + CallerProgram
+    fn process_spot_unlock_usdc(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        assert_writable(user_account_info)?;
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        
+        if user_account.spot_locked_e6 < amount as i64 {
+            msg!("❌ SpotUnlockUsdc: insufficient spot_locked={}, required={}", 
+                user_account.spot_locked_e6, amount);
+            return Err(VaultError::InsufficientSpotLocked.into());
+        }
+
+        user_account.spot_locked_e6 = checked_sub(user_account.spot_locked_e6, amount as i64)?;
+        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, amount as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("✅ SpotUnlockUsdc: {} e6 unlocked for {}", amount, user_account.wallet);
+        Ok(())
+    }
+
+    /// SpotSettleUsdcTrade — 原子结算 Spot 交易的 USDC + base token
+    /// 
+    /// 一笔交易同时操作 4 个 PDA：
+    ///   Buyer UserAccount:         spot_locked -= (buyer_usdc + buyer_fee)
+    ///   Seller UserAccount:        available += (seller_credit - seller_fee)
+    ///   Buyer SpotTokenBalance:    available += base_amount (auto-init)
+    ///   Seller SpotTokenBalance:   locked -= base_amount
+    ///
+    /// 自交处理：当 buyer == seller 时合并为一次 UserAccount 读写。
+    fn process_spot_settle_usdc_trade(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        buyer_usdc: u64,
+        seller_credit: u64,
+        buyer_fee: u64,
+        seller_fee: u64,
+        base_amount: u64,
+        sequence: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let buyer_account_info = next_account_info(account_info_iter)?;
+        let seller_account_info = next_account_info(account_info_iter)?;
+        let buyer_base_info = next_account_info(account_info_iter)?;
+        let seller_base_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        assert_writable(buyer_account_info)?;
+        assert_writable(seller_account_info)?;
+        assert_writable(buyer_base_info)?;
+        assert_writable(seller_base_info)?;
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.is_paused {
+            return Err(VaultError::VaultPaused.into());
+        }
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        
+        // 检测自交
+        let is_self_trade = buyer_account_info.key == seller_account_info.key;
+
+        if is_self_trade {
+            // --- 自交处理：同一个 UserAccount，base token net = 0 ---
+            let mut user = deserialize_account::<UserAccount>(&buyer_account_info.data.borrow())?;
+            
+            // USDC: spot_locked -= (buyer_usdc + buyer_fee), available += (seller_credit - seller_fee)
+            let total_buyer_deduct = checked_add(buyer_usdc as i64, buyer_fee as i64)?;
+            if user.spot_locked_e6 < total_buyer_deduct {
+                msg!("❌ SpotSettleUsdcTrade self-trade: insufficient spot_locked={}, required={}", 
+                    user.spot_locked_e6, total_buyer_deduct);
+                return Err(VaultError::InsufficientSpotLocked.into());
+            }
+            user.spot_locked_e6 = checked_sub(user.spot_locked_e6, total_buyer_deduct)?;
+            
+            let seller_net = checked_sub(seller_credit as i64, seller_fee as i64)?;
+            user.available_balance_e6 = checked_add(user.available_balance_e6, seller_net)?;
+            user.last_update_ts = current_ts;
+            user.serialize(&mut &mut buyer_account_info.data.borrow_mut()[..])?;
+            
+            // Base token: self-trade net = 0, only deduct fees from quote
+            // No base token PDA changes needed
+            
+            msg!("✅ SpotSettleUsdcTrade (self-trade): seq={}, usdc_fee={}, wallet={}",
+                sequence, buyer_fee + seller_fee, user.wallet);
+        } else {
+            // --- 非自交：分别更新 buyer 和 seller ---
+            
+            // Buyer: spot_locked -= (buyer_usdc + buyer_fee)
+            let mut buyer = deserialize_account::<UserAccount>(&buyer_account_info.data.borrow())?;
+            let total_buyer_deduct = checked_add(buyer_usdc as i64, buyer_fee as i64)?;
+            if buyer.spot_locked_e6 < total_buyer_deduct {
+                msg!("❌ SpotSettleUsdcTrade: buyer insufficient spot_locked={}, required={}", 
+                    buyer.spot_locked_e6, total_buyer_deduct);
+                return Err(VaultError::InsufficientSpotLocked.into());
+            }
+            buyer.spot_locked_e6 = checked_sub(buyer.spot_locked_e6, total_buyer_deduct)?;
+            buyer.last_update_ts = current_ts;
+            buyer.serialize(&mut &mut buyer_account_info.data.borrow_mut()[..])?;
+
+            // Seller: available += (seller_credit - seller_fee)
+            let mut seller = deserialize_account::<UserAccount>(&seller_account_info.data.borrow())?;
+            let seller_net = checked_sub(seller_credit as i64, seller_fee as i64)?;
+            seller.available_balance_e6 = checked_add(seller.available_balance_e6, seller_net)?;
+            seller.last_update_ts = current_ts;
+            seller.serialize(&mut &mut seller_account_info.data.borrow_mut()[..])?;
+
+            // Buyer base token: available += base_amount (auto-init if needed)
+            let buyer_wallet = buyer.wallet;
+            let mut buyer_base = deserialize_account::<SpotTokenBalance>(&buyer_base_info.data.borrow())?;
+            buyer_base.available_e6 = checked_add(buyer_base.available_e6, base_amount as i64)?;
+            buyer_base.last_update_ts = current_ts;
+            buyer_base.serialize(&mut &mut buyer_base_info.data.borrow_mut()[..])?;
+
+            // Seller base token: locked -= base_amount
+            let mut seller_base = deserialize_account::<SpotTokenBalance>(&seller_base_info.data.borrow())?;
+            if seller_base.locked_e6 < base_amount as i64 {
+                msg!("❌ SpotSettleUsdcTrade: seller insufficient base locked={}, required={}", 
+                    seller_base.locked_e6, base_amount);
+                return Err(VaultError::InsufficientBalance.into());
+            }
+            seller_base.locked_e6 = checked_sub(seller_base.locked_e6, base_amount as i64)?;
+            seller_base.last_update_ts = current_ts;
+            seller_base.serialize(&mut &mut seller_base_info.data.borrow_mut()[..])?;
+
+            msg!("✅ SpotSettleUsdcTrade: seq={}, buyer={}, seller={}, usdc={}, base={}",
+                sequence, buyer_wallet, seller.wallet, buyer_usdc, base_amount);
+        }
+
         Ok(())
     }
 }

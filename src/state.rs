@@ -133,10 +133,10 @@ pub struct UserAccount {
     /// PDA bump
     pub bump: u8,
     
-    /// 可用余额 (e6)
+    /// 可用余额 (e6) — Perp/Spot/PM 统一可用
     pub available_balance_e6: i64,
     
-    /// 锁定的保证金 (e6)
+    /// 锁定的保证金 (e6) — Perp 持仓保证金
     pub locked_margin_e6: i64,
     
     /// 未实现盈亏 (e6) - 由 Position 更新
@@ -151,16 +151,38 @@ pub struct UserAccount {
     /// 最后更新时间戳
     pub last_update_ts: i64,
     
-    /// 预留字段 (扩展用)
-    pub reserved: [u8; 64],
+    /// Spot BUY 订单锁定的 USDC (e6)
+    /// 
+    /// One Account Experience: USDC 不再通过 SpotTokenBalance PDA 管理，
+    /// 而是直接在 UserAccount 内通过 available ↔ spot_locked 字段搬运。
+    /// 
+    /// 与 locked_margin_e6 (Perp) 对称：
+    ///   - SpotLockUsdc:   available -= X, spot_locked += X
+    ///   - SpotUnlockUsdc: spot_locked -= X, available += X
+    ///   - SpotSettleUsdcTrade: buyer.spot_locked -= X, seller.available += X
+    /// 
+    /// 注意：此字段位于原 reserved 的前 8 字节（offset 89），
+    /// Borsh 兼容性：旧 PDA 的 reserved[0..8] = 0 → spot_locked_e6 = 0（正确初始值）。
+    pub spot_locked_e6: i64,
+    
+    /// 预留字段 (扩展用) — 从 64 缩减为 56（腾出 8 字节给 spot_locked_e6）
+    pub reserved: [u8; 56],
 }
 
 impl UserAccount {
     pub const DISCRIMINATOR: u64 = 0x555345525F414343; // "USER_ACC"
     
     /// 计算权益 (Equity)
+    /// 
+    /// equity = 可用余额 + Perp 锁定保证金 + Spot 锁定 USDC + 未实现盈亏
+    /// 
+    /// 注意：此方法仅用于查询/显示，不被任何链上 processor 指令调用。
+    /// 链上余额执行依赖各指令内的逐字段检查（available >= amount 等）。
     pub fn equity(&self) -> i64 {
-        self.available_balance_e6 + self.locked_margin_e6 + self.unrealized_pnl_e6
+        self.available_balance_e6
+            .saturating_add(self.locked_margin_e6)
+            .saturating_add(self.spot_locked_e6)
+            .saturating_add(self.unrealized_pnl_e6)
     }
 }
 
@@ -579,10 +601,32 @@ mod tests {
             total_deposited_e6: 1000_000_000,
             total_withdrawn_e6: 0,
             last_update_ts: 0,
-            reserved: [0; 64],
+            spot_locked_e6: 300_000_000,
+            reserved: [0; 56],
         };
         
-        assert_eq!(account.equity(), 1700_000_000);
+        // equity = available(1000) + locked_margin(500) + spot_locked(300) + unrealized_pnl(200) = 2000
+        assert_eq!(account.equity(), 2000_000_000);
+    }
+    
+    #[test]
+    fn test_user_account_size_unchanged() {
+        let account = UserAccount {
+            discriminator: UserAccount::DISCRIMINATOR,
+            wallet: Pubkey::new_unique(),
+            bump: 0,
+            available_balance_e6: 0,
+            locked_margin_e6: 0,
+            unrealized_pnl_e6: 0,
+            total_deposited_e6: 0,
+            total_withdrawn_e6: 0,
+            last_update_ts: 0,
+            spot_locked_e6: 0,
+            reserved: [0; 56],
+        };
+        let serialized = borsh::to_vec(&account).unwrap();
+        // 8(disc) + 32(wallet) + 1(bump) + 7*8(i64 fields) + 56(reserved) = 153
+        assert_eq!(serialized.len(), 153, "UserAccount size must remain 153 bytes");
     }
 
     #[test]

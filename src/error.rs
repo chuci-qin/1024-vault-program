@@ -114,6 +114,14 @@ pub enum VaultError {
     /// Deprecated instruction (no longer supported)
     #[error("Deprecated instruction")]
     DeprecatedInstruction,
+
+    /// Quote asset (USDC, token_index=0) must use Vault Deposit/Withdraw, not Spot path
+    #[error("Quote asset must use Vault Deposit/Withdraw path")]
+    QuoteAssetMustUseVaultPath,
+
+    /// Insufficient spot locked balance
+    #[error("Insufficient spot locked balance")]
+    InsufficientSpotLocked,
 }
 
 impl From<VaultError> for ProgramError {

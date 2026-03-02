@@ -810,5 +810,65 @@ pub enum VaultInstruction {
         /// 出金金额 (e6)
         amount: u64,
     },
+
+    // =========================================================================
+    // One Account Experience — Spot USDC 统一管理指令
+    // =========================================================================
+
+    /// Spot BUY 订单 USDC 锁定 (CPI or Admin)
+    ///
+    /// 将 USDC 从 available_balance 移到 spot_locked（同一 PDA 内的字段搬运）。
+    /// 与 LockMargin (Perp) 完全对称。
+    ///
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` Caller Program (CPI auth) 或 Admin (signer)
+    SpotLockUsdc {
+        amount: u64,
+    },
+
+    /// Spot BUY 订单 USDC 解锁 (CPI or Admin)
+    ///
+    /// 将 USDC 从 spot_locked 移回 available_balance。
+    /// 用于撤单或回滚。与 ReleaseMargin (Perp) 完全对称。
+    ///
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` Caller Program (CPI auth) 或 Admin (signer)
+    SpotUnlockUsdc {
+        amount: u64,
+    },
+
+    /// Spot 成交 USDC 结算 (CPI or Admin)
+    ///
+    /// 原子结算一笔 Spot 交易的 USDC 部分：
+    ///   - Buyer: spot_locked -= (buyer_usdc + buyer_fee)
+    ///   - Seller: available += (seller_credit - seller_fee)
+    /// Base token (wBTC/wETH/wSOL) 部分仍通过 SpotTokenBalance PDA 处理。
+    ///
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` Buyer UserAccount PDA
+    /// 2. `[writable]` Seller UserAccount PDA (自交时与 1 相同)
+    /// 3. `[writable]` Buyer SpotTokenBalance(base) PDA
+    /// 4. `[writable]` Seller SpotTokenBalance(base) PDA (自交时与 3 相同)
+    /// 5. `[]` Caller Program (CPI auth) 或 Admin (signer)
+    /// 6. `[]` System Program (for auto-init buyer base PDA)
+    SpotSettleUsdcTrade {
+        /// 买方支付的 USDC 金额 (不含 fee)
+        buyer_usdc: u64,
+        /// 卖方获得的 USDC 金额 (不含 fee)
+        seller_credit: u64,
+        /// 买方手续费
+        buyer_fee: u64,
+        /// 卖方手续费
+        seller_fee: u64,
+        /// Base token 数量 (e6)
+        base_amount: u64,
+        /// 交易序号 (幂等性 / 去重)
+        sequence: u64,
+    },
 }
 

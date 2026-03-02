@@ -107,12 +107,13 @@ async fn test_state_calculations() {
         total_deposited_e6: 1000_000_000,
         total_withdrawn_e6: 0,
         last_update_ts: 0,
-        reserved: [0; 64],
+        spot_locked_e6: 100_000_000,        // 100 USDC (One Account Experience)
+        reserved: [0; 56],
     };
 
-    // equity = available + locked + unrealized_pnl
-    // = 1000 + 500 + 200 = 1700 USDC
-    assert_eq!(user_account.equity(), 1700_000_000);
+    // equity = available + locked_margin + spot_locked + unrealized_pnl
+    // = 1000 + 500 + 100 + 200 = 1800 USDC
+    assert_eq!(user_account.equity(), 1800_000_000);
     
     // 验证结构体字段
     assert_eq!(user_account.available_balance_e6, 1000_000_000);
