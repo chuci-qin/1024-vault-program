@@ -86,6 +86,29 @@ fn verify_cpi_caller(
     Ok(())
 }
 
+/// 验证调用方：支持 Admin 签名（直接调用）或 CPI 调用方（跨程序调用）
+/// 
+/// Spot 系列指令需要同时支持两种调用模式：
+/// 1. Admin/Relayer 直接签名调用（后端 SpotBackend 发送交易）
+/// 2. 其他链上程序通过 CPI 调用（未来扩展）
+fn verify_admin_or_cpi_caller(
+    vault_config: &VaultConfig,
+    caller: &AccountInfo,
+) -> ProgramResult {
+    if caller.is_signer && caller.key == &vault_config.admin {
+        msg!("✅ Caller verified as admin signer");
+        return Ok(());
+    }
+    
+    if vault_config.is_authorized_caller(caller.key) {
+        verify_cpi_caller(vault_config, caller)?;
+        return Ok(());
+    }
+    
+    msg!("❌ Caller {} is neither admin signer nor authorized CPI caller", caller.key);
+    Err(VaultError::UnauthorizedCaller.into())
+}
+
 /// Program state handler
 pub struct Processor;
 
@@ -3284,7 +3307,7 @@ impl Processor {
     /// SpotLockUsdc — 将 USDC 从 available 移到 spot_locked（同一 PDA 内）
     /// 
     /// 与 LockMargin (Perp) 完全对称。
-    /// Accounts: VaultConfig + UserAccount(w) + CallerProgram
+    /// Accounts: VaultConfig + UserAccount(w) + Admin(signer) or CallerProgram(CPI)
     fn process_spot_lock_usdc(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
         if amount > i64::MAX as u64 {
             msg!("❌ SpotLockUsdc: amount {} exceeds i64::MAX", amount);
@@ -3294,7 +3317,7 @@ impl Processor {
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
+        let caller = next_account_info(account_info_iter)?;
 
         assert_writable(user_account_info)?;
 
@@ -3306,7 +3329,7 @@ impl Processor {
         if vault_config.is_paused {
             return Err(VaultError::VaultPaused.into());
         }
-        verify_cpi_caller(&vault_config, caller_program)?;
+        verify_admin_or_cpi_caller(&vault_config, caller)?;
 
         let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
         
@@ -3328,7 +3351,7 @@ impl Processor {
     /// SpotUnlockUsdc — 将 USDC 从 spot_locked 移回 available
     /// 
     /// 与 ReleaseMargin (Perp) 完全对称。用于撤单或回滚。
-    /// Accounts: VaultConfig + UserAccount(w) + CallerProgram
+    /// Accounts: VaultConfig + UserAccount(w) + Admin(signer) or CallerProgram(CPI)
     fn process_spot_unlock_usdc(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
         if amount > i64::MAX as u64 {
             msg!("❌ SpotUnlockUsdc: amount {} exceeds i64::MAX", amount);
@@ -3338,7 +3361,7 @@ impl Processor {
         let account_info_iter = &mut accounts.iter();
         let vault_config_info = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
+        let caller = next_account_info(account_info_iter)?;
 
         assert_writable(user_account_info)?;
 
@@ -3347,7 +3370,7 @@ impl Processor {
         }
 
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
+        verify_admin_or_cpi_caller(&vault_config, caller)?;
 
         let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
         
@@ -3404,7 +3427,7 @@ impl Processor {
         let seller_account_info = next_account_info(account_info_iter)?;
         let buyer_base_info = next_account_info(account_info_iter)?;
         let seller_base_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
+        let caller = next_account_info(account_info_iter)?;
         let system_program = next_account_info(account_info_iter)?;
 
         assert_writable(buyer_account_info)?;
@@ -3416,7 +3439,7 @@ impl Processor {
         if vault_config.is_paused {
             return Err(VaultError::VaultPaused.into());
         }
-        verify_cpi_caller(&vault_config, caller_program)?;
+        verify_admin_or_cpi_caller(&vault_config, caller)?;
 
         let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         
@@ -3483,7 +3506,7 @@ impl Processor {
                     buyer_base_info, program_id, &buyer_wallet, base_token_index
                 )?;
                 Self::auto_init_spot_balance(
-                    caller_program, buyer_base_info, system_program, program_id,
+                    caller, buyer_base_info, system_program, program_id,
                     &buyer_wallet, base_token_index, buyer_base_bump,
                 )?;
             }
