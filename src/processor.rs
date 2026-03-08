@@ -622,7 +622,13 @@ impl Processor {
 
         let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
         
-        if user_account.available_balance_e6 < amount as i64 {
+        // S3-8.5 (DEC-4): Include unrealized_pnl_e6 in available balance check.
+        // Industry standard: cross margin uses floating PnL for buying power.
+        let effective_available = user_account.available_balance_e6 + user_account.unrealized_pnl_e6;
+        if effective_available < amount as i64 {
+            msg!("InsufficientBalance: available={}, upnl={}, effective={}, required={}",
+                user_account.available_balance_e6, user_account.unrealized_pnl_e6,
+                effective_available, amount);
             return Err(VaultError::InsufficientBalance.into());
         }
 
