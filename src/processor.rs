@@ -113,6 +113,28 @@ fn verify_admin_or_cpi_caller(
 pub struct Processor;
 
 impl Processor {
+    /// Verify PMFeeConfig PDA is derived from the Fund program stored in VaultConfig.
+    /// Prevents spoofed PMFeeConfig accounts that could set fee rates to 0.
+    fn verify_pm_fee_config_pda(
+        pm_fee_config_info: &AccountInfo,
+        vault_config: &VaultConfig,
+    ) -> ProgramResult {
+        if vault_config.fund_program == Pubkey::default() {
+            msg!("⚠️ Fund program not set in VaultConfig, skipping PMFeeConfig PDA check");
+            return Ok(());
+        }
+        let (expected_pda, _) = Pubkey::find_program_address(
+            &[b"prediction_market_fee_config"],
+            &vault_config.fund_program,
+        );
+        if pm_fee_config_info.key != &expected_pda {
+            msg!("❌ PMFeeConfig PDA mismatch: got {}, expected {} (derived from fund_program {})",
+                 pm_fee_config_info.key, expected_pda, vault_config.fund_program);
+            return Err(VaultError::InvalidPda.into());
+        }
+        Ok(())
+    }
+
     /// Process instruction
     pub fn process(
         program_id: &Pubkey,
@@ -1868,6 +1890,9 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
+        // 2.5 验证 PMFeeConfig PDA 地址（防伪造）
+        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
+
         // 3. 读取 PM Fee Config 获取费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
         let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
         if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
@@ -2038,6 +2063,9 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
+        // 2.5 验证 PMFeeConfig PDA 地址（防伪造）
+        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
+
         // 3. 读取 PM Fee Config 获取费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
         let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
         if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
@@ -2154,6 +2182,9 @@ impl Processor {
             msg!("❌ Invalid vault_token_account");
             return Err(VaultError::InvalidAccount.into());
         }
+
+        // 2.5 验证 PMFeeConfig PDA 地址（防伪造）
+        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
 
         // 3. 读取 PM Fee Config 获取结算费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
         const SETTLEMENT_FEE_BPS_OFFSET: usize = 49;
@@ -3419,6 +3450,8 @@ impl Processor {
 
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
         verify_cpi_caller(&vault_config, caller_program)?;
+
+        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
 
         // Read settlement fee rate from PMFeeConfig (owned by Fund program, read-only)
         const SETTLEMENT_FEE_BPS_OFFSET: usize = 49;
