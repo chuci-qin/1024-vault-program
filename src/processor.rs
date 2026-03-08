@@ -43,8 +43,8 @@ mod pm_fee_config_offsets {
     pub const _PROTOCOL_SHARE_BPS: usize = 51;    // 2 bytes (u16)
     pub const _MAKER_REWARD_SHARE_BPS: usize = 53; // 2 bytes (u16)
     pub const _CREATOR_SHARE_BPS: usize = 55;     // 2 bytes (u16)
-    pub const TOTAL_MINTING_FEE: usize = 57;      // 8 bytes (i64)
-    pub const TOTAL_REDEMPTION_FEE: usize = 65;   // 8 bytes (i64)
+    pub const _TOTAL_MINTING_FEE: usize = 57;      // 8 bytes (i64) — stat write removed (Fund-owned PDA)
+    pub const _TOTAL_REDEMPTION_FEE: usize = 65;   // 8 bytes (i64) — stat write removed (Fund-owned PDA)
     pub const MIN_SIZE: usize = 150;
 }
 
@@ -383,6 +383,10 @@ impl Processor {
             VaultInstruction::SpotSettleUsdcTrade { buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index } => {
                 msg!("Instruction: SpotSettleUsdcTrade");
                 Self::process_spot_settle_usdc_trade(program_id, accounts, buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index)
+            }
+            VaultInstruction::PredictionMarketSettleToAvailableWithFee { locked_amount, settlement_amount } => {
+                msg!("Instruction: PredictionMarketSettleToAvailableWithFee");
+                Self::process_prediction_market_settle_to_available_with_fee(program_id, accounts, locked_amount, settlement_amount)
             }
         }
     }
@@ -1820,7 +1824,7 @@ impl Processor {
     /// 3. `[]` Caller Program
     /// 4. `[writable]` Vault Token Account
     /// 5. `[writable]` PM Fee Vault
-    /// 6. `[writable]` PM Fee Config PDA
+    /// 6. `[]` PM Fee Config PDA (read-only: fee rates only)
     /// 7. `[]` Token Program
     /// 8. `[signer, writable]` Payer (optional, for auto-init)
     /// 9. `[]` System Program (optional, for auto-init)
@@ -1839,7 +1843,7 @@ impl Processor {
         let vault_token_account_info = next_account_info(account_info_iter)?;
         let pm_fee_vault_info = next_account_info(account_info_iter)?;
         let pm_fee_config_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
+        let _token_program_info = next_account_info(account_info_iter)?;
         
         // 可选账户 (用于 auto-init PMUserAccount)
         let payer_info = next_account_info(account_info_iter).ok();
@@ -1849,7 +1853,6 @@ impl Processor {
         assert_writable(pm_user_account_info)?;
         assert_writable(vault_token_account_info)?;
         assert_writable(pm_fee_vault_info)?;
-        assert_writable(pm_fee_config_info)?;
 
         if gross_amount == 0 {
             return Err(VaultError::InvalidAmount.into());
@@ -1865,7 +1868,7 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
-        // 3. 读取 PM Fee Config 获取费率
+        // 3. 读取 PM Fee Config 获取费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
         let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
         if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
             msg!("❌ PM Fee Config not initialized");
@@ -1977,25 +1980,9 @@ impl Processor {
             
             let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
-            // G5 A1: 删除真实 USDC 转账（纯记账模式 — USDC 留在主金库）
-            // 原: token_compat::transfer(... vault → pm_fee_vault ...)
-            // 手续费仅通过 PDA 统计字段累加追踪
-            msg!("PM fee {} recorded (pure accounting, no transfer)", fee_amount);
-            let _ = pm_fee_vault_info; // suppress unused warning
-            
-            // 9. 更新 PM Fee Config 统计 (累加 total_minting_fee)
-            let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
-            let current_total = i64::from_le_bytes(
-                pm_fee_config_data[pm_fee_config_offsets::TOTAL_MINTING_FEE..pm_fee_config_offsets::TOTAL_MINTING_FEE + 8]
-                    .try_into()
-                    .unwrap()
-            );
-            let new_total = current_total.saturating_add(fee_amount as i64);
-            pm_fee_config_data[pm_fee_config_offsets::TOTAL_MINTING_FEE..pm_fee_config_offsets::TOTAL_MINTING_FEE + 8]
-                .copy_from_slice(&new_total.to_le_bytes());
-            drop(pm_fee_config_data);
-            
-            msg!("✅ Minting fee {} collected (total: {})", fee_amount, new_total);
+            // 纯记账模式：USDC 留在主金库，fee = gross - net
+            msg!("PM minting fee {} recorded (pure accounting, no transfer)", fee_amount);
+            let _ = pm_fee_vault_info;
         }
 
         msg!("✅ PredictionMarketLockWithFee completed: gross={}, fee={}, net={}", 
@@ -2014,7 +2001,7 @@ impl Processor {
     /// 3. `[]` Caller Program
     /// 4. `[writable]` Vault Token Account
     /// 5. `[writable]` PM Fee Vault
-    /// 6. `[writable]` PM Fee Config PDA
+    /// 6. `[]` PM Fee Config PDA (read-only: fee rates only)
     /// 7. `[]` Token Program
     fn process_prediction_market_unlock_with_fee(
         program_id: &Pubkey,
@@ -2030,13 +2017,12 @@ impl Processor {
         let vault_token_account_info = next_account_info(account_info_iter)?;
         let pm_fee_vault_info = next_account_info(account_info_iter)?;
         let pm_fee_config_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
+        let _token_program_info = next_account_info(account_info_iter)?;
 
         assert_writable(user_account_info)?;
         assert_writable(pm_user_account_info)?;
         assert_writable(vault_token_account_info)?;
         assert_writable(pm_fee_vault_info)?;
-        assert_writable(pm_fee_config_info)?;
 
         if gross_amount == 0 {
             return Err(VaultError::InvalidAmount.into());
@@ -2052,7 +2038,7 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
-        // 3. 读取 PM Fee Config 获取费率
+        // 3. 读取 PM Fee Config 获取费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
         let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
         if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
             msg!("❌ PM Fee Config not initialized");
@@ -2112,23 +2098,9 @@ impl Processor {
             
             let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
-            // G5 A1: 删除真实 USDC 转账（纯记账模式）
-            msg!("PM fee {} recorded (pure accounting, no transfer)", fee_amount);
+            // 纯记账模式：USDC 留在主金库，fee = gross - net
+            msg!("PM redemption fee {} recorded (pure accounting, no transfer)", fee_amount);
             let _ = pm_fee_vault_info;
-            
-            // 8. 更新 PM Fee Config 统计 (累加 total_redemption_fee)
-            let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
-            let current_total = i64::from_le_bytes(
-                pm_fee_config_data[pm_fee_config_offsets::TOTAL_REDEMPTION_FEE..pm_fee_config_offsets::TOTAL_REDEMPTION_FEE + 8]
-                    .try_into()
-                    .unwrap()
-            );
-            let new_total = current_total.saturating_add(fee_amount as i64);
-            pm_fee_config_data[pm_fee_config_offsets::TOTAL_REDEMPTION_FEE..pm_fee_config_offsets::TOTAL_REDEMPTION_FEE + 8]
-                .copy_from_slice(&new_total.to_le_bytes());
-            drop(pm_fee_config_data);
-            
-            msg!("✅ Redemption fee {} collected (total: {})", fee_amount, new_total);
         }
 
         msg!("✅ PredictionMarketUnlockWithFee completed: gross={}, fee={}, net={}", 
@@ -2140,118 +2112,15 @@ impl Processor {
     /// 
     /// 仅收取交易费，不修改用户余额。余额调整由 PM Program 完成。
     fn process_prediction_market_trade_with_fee(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
+        _program_id: &Pubkey,
+        _accounts: &[AccountInfo],
         trade_amount: u64,
         is_taker: bool,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-        let vault_token_account_info = next_account_info(account_info_iter)?;
-        let pm_fee_vault_info = next_account_info(account_info_iter)?;
-        let pm_fee_config_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
-
-        assert_writable(vault_token_account_info)?;
-        assert_writable(pm_fee_vault_info)?;
-        assert_writable(pm_fee_config_info)?;
-
-        if trade_amount == 0 {
-            msg!("Trade amount is 0, no fee to collect");
-            return Ok(());
-        }
-
-        // 1. 验证 VaultConfig 和 CPI 调用方
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        // 2. 验证 Vault Token Account
-        if vault_token_account_info.key != &vault_config.vault_token_account {
-            msg!("❌ Invalid vault_token_account");
-            return Err(VaultError::InvalidAccount.into());
-        }
-
-        // 3. 读取 PM Fee Config 获取费率
-        // Taker fee at offset 45, Maker fee at offset 47
-        const TAKER_FEE_BPS_OFFSET: usize = 45;
-        const MAKER_FEE_BPS_OFFSET: usize = 47;
-        const TOTAL_TRADING_FEE_OFFSET: usize = 73; // 57 + 8 + 8 = 73
-
-        let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
-        if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
-            msg!("❌ PM Fee Config not initialized");
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        let fee_bps = if is_taker {
-            u16::from_le_bytes([
-                pm_fee_config_data[TAKER_FEE_BPS_OFFSET],
-                pm_fee_config_data[TAKER_FEE_BPS_OFFSET + 1],
-            ])
-        } else {
-            u16::from_le_bytes([
-                pm_fee_config_data[MAKER_FEE_BPS_OFFSET],
-                pm_fee_config_data[MAKER_FEE_BPS_OFFSET + 1],
-            ])
-        };
-        
-        // 验证 PM Fee Vault
-        let expected_fee_vault = Pubkey::new_from_array(
-            pm_fee_config_data[pm_fee_config_offsets::FEE_VAULT..pm_fee_config_offsets::FEE_VAULT + 32]
-                .try_into()
-                .unwrap()
-        );
-        
-        if pm_fee_vault_info.key != &expected_fee_vault {
-            msg!("❌ PM Fee Vault mismatch");
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        drop(pm_fee_config_data);
-
-        // 4. 计算交易费
-        let fee_amount = ((trade_amount as u128) * (fee_bps as u128) / 10000) as u64;
-        
-        msg!("PM Trade Fee: amount={}, is_taker={}, fee_bps={}, fee={}", 
-             trade_amount, is_taker, fee_bps, fee_amount);
-
-        // 5. 如果有 fee，执行 Token Transfer
-        if fee_amount > 0 {
-            let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(
-                &[b"vault_config"],
-                program_id,
-            );
-            
-            if vault_config_info.key != &vault_config_pda {
-                msg!("❌ Invalid VaultConfig PDA");
-                return Err(VaultError::InvalidPda.into());
-            }
-            
-            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
-            
-            // G5 A1: 删除真实 USDC 转账（纯记账模式）
-            msg!("PM trading fee {} recorded (pure accounting, no transfer)", fee_amount);
-            let _ = pm_fee_vault_info;
-            
-            // 6. 更新 PM Fee Config 统计 (累加 total_trading_fee)
-            let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
-            let current_total = i64::from_le_bytes(
-                pm_fee_config_data[TOTAL_TRADING_FEE_OFFSET..TOTAL_TRADING_FEE_OFFSET + 8]
-                    .try_into()
-                    .unwrap()
-            );
-            let new_total = current_total.saturating_add(fee_amount as i64);
-            pm_fee_config_data[TOTAL_TRADING_FEE_OFFSET..TOTAL_TRADING_FEE_OFFSET + 8]
-                .copy_from_slice(&new_total.to_le_bytes());
-            drop(pm_fee_config_data);
-            
-            msg!("✅ Trading fee {} collected (total: {})", fee_amount, new_total);
-        }
-
-        msg!("✅ PredictionMarketTradeWithFee completed: amount={}, is_taker={}, fee={}", 
-             trade_amount, is_taker, fee_amount);
+        // No-op: PM trading fees are collected off-chain by executor.rs.
+        // This handler is kept for backward compatibility with PM program CPI calls
+        // (DirectTrade/MatchMint/MatchBurn use `if let Err(e) = cpi_trade_with_fee(...)`).
+        msg!("TradeWithFee no-op: amount={}, is_taker={}, fee collected off-chain", trade_amount, is_taker);
         Ok(())
     }
 
@@ -2270,12 +2139,11 @@ impl Processor {
         let vault_token_account_info = next_account_info(account_info_iter)?;
         let pm_fee_vault_info = next_account_info(account_info_iter)?;
         let pm_fee_config_info = next_account_info(account_info_iter)?;
-        let token_program_info = next_account_info(account_info_iter)?;
+        let _token_program_info = next_account_info(account_info_iter)?;
 
         assert_writable(pm_user_account_info)?;
         assert_writable(vault_token_account_info)?;
         assert_writable(pm_fee_vault_info)?;
-        assert_writable(pm_fee_config_info)?;
 
         // 1. 验证 VaultConfig 和 CPI 调用方
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
@@ -2287,7 +2155,7 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
-        // 3. 读取 PM Fee Config 获取结算费率
+        // 3. 读取 PM Fee Config 获取结算费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
         const SETTLEMENT_FEE_BPS_OFFSET: usize = 49;
         
         let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
@@ -2354,24 +2222,9 @@ impl Processor {
             
             let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
             
-            // G5 A1: 删除真实 USDC 转账（纯记账模式）
+            // 纯记账模式：USDC 留在主金库，fee = settlement - net_settlement
             msg!("PM settlement fee {} recorded (pure accounting, no transfer)", fee_amount);
             let _ = pm_fee_vault_info;
-            
-            // CRITICAL-3 修复：更新 PM Fee Config 统计（settlement 费用计入 trading_fee 统计）
-            const SETTLE_FEE_OFFSET: usize = 73; // 与 TOTAL_TRADING_FEE_OFFSET 相同
-            let mut pm_fee_config_data = pm_fee_config_info.try_borrow_mut_data()?;
-            let current_total = i64::from_le_bytes(
-                pm_fee_config_data[SETTLE_FEE_OFFSET..SETTLE_FEE_OFFSET + 8]
-                    .try_into()
-                    .unwrap()
-            );
-            let new_total = current_total.saturating_add(fee_amount as i64);
-            pm_fee_config_data[SETTLE_FEE_OFFSET..SETTLE_FEE_OFFSET + 8]
-                .copy_from_slice(&new_total.to_le_bytes());
-            drop(pm_fee_config_data);
-            
-            msg!("✅ Settlement fee {} collected + PDA stats updated (total_trading_fee: {})", fee_amount, new_total);
         }
 
         msg!("✅ PredictionMarketSettleWithFee completed: locked={}, settlement={}, fee={}, net={}", 
@@ -3536,6 +3389,83 @@ impl Processor {
                 sequence, buyer_wallet, seller.wallet, buyer_usdc, base_amount);
         }
 
+        Ok(())
+    }
+
+    /// PM SettleToAvailableWithFee — 结算到 available_balance 并收取手续费（一步完成）
+    ///
+    /// 与 SettleToAvailable(43) 相同逻辑但扣除 settlement fee。
+    /// fee = settlement_amount * settlement_fee_bps / 10000
+    /// net = settlement_amount - fee
+    /// pm_locked -= locked_amount, available_balance += net
+    /// fee 留在主金库（纯记账模式）
+    ///
+    /// Accounts: vault_config, user_account, pm_user_account, caller_program, pm_fee_config
+    fn process_prediction_market_settle_to_available_with_fee(
+        _program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        locked_amount: u64,
+        settlement_amount: u64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let pm_user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+        let pm_fee_config_info = next_account_info(account_info_iter)?;
+
+        assert_writable(user_account_info)?;
+        assert_writable(pm_user_account_info)?;
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        // Read settlement fee rate from PMFeeConfig (owned by Fund program, read-only)
+        const SETTLEMENT_FEE_BPS_OFFSET: usize = 49;
+        let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
+        if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
+            msg!("❌ PM Fee Config not initialized");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        let settlement_fee_bps = u16::from_le_bytes([
+            pm_fee_config_data[SETTLEMENT_FEE_BPS_OFFSET],
+            pm_fee_config_data[SETTLEMENT_FEE_BPS_OFFSET + 1],
+        ]);
+        drop(pm_fee_config_data);
+
+        let fee_amount = ((settlement_amount as u128) * (settlement_fee_bps as u128) / 10000) as u64;
+        let net_settlement = settlement_amount.saturating_sub(fee_amount);
+
+        // Release locked amount from PMUserAccount
+        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
+        if locked_amount > 0 {
+            if pm_user_account.prediction_market_locked_e6 < locked_amount as i64 {
+                msg!("SettleToAvailableWithFee: insufficient pm_locked {} < {}",
+                     pm_user_account.prediction_market_locked_e6, locked_amount);
+                return Err(VaultError::InsufficientMargin.into());
+            }
+            pm_user_account.prediction_market_locked_e6 -= locked_amount as i64;
+        }
+        pm_user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
+
+        // Credit net settlement to UserAccount.available_balance
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        if user_account.wallet != pm_user_account.wallet {
+            msg!("SettleToAvailableWithFee: wallet mismatch user={} pm={}",
+                 user_account.wallet, pm_user_account.wallet);
+            return Err(VaultError::InvalidAccount.into());
+        }
+        if net_settlement > 0 {
+            user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, net_settlement as i64)?;
+        }
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("PM SettleToAvailableWithFee: locked={}, settlement={}, fee_bps={}, fee={}, net={}",
+             locked_amount, settlement_amount, settlement_fee_bps, fee_amount, net_settlement);
+        msg!("PM settlement fee {} recorded (pure accounting, no transfer)", fee_amount);
         Ok(())
     }
 }

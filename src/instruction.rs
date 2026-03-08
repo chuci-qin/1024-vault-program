@@ -872,5 +872,14 @@ pub enum VaultInstruction {
         /// Base token 索引 (e.g., BTC=1), 用于 auto-init buyer base PDA
         base_token_index: u16,
     },
+
+    /// Index 49: PM 结算到 available_balance 并收取手续费（一步完成）
+    ///
+    /// 与 SettleToAvailable(43) 相同但扣除 settlement fee。
+    /// Accounts: vault_config, user_account, pm_user_account, caller_program, pm_fee_config
+    PredictionMarketSettleToAvailableWithFee {
+        locked_amount: u64,
+        settlement_amount: u64,
+    },
 }
 
