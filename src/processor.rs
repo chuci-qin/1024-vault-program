@@ -43,8 +43,6 @@ mod pm_fee_config_offsets {
     pub const _PROTOCOL_SHARE_BPS: usize = 51;    // 2 bytes (u16)
     pub const _MAKER_REWARD_SHARE_BPS: usize = 53; // 2 bytes (u16)
     pub const _CREATOR_SHARE_BPS: usize = 55;     // 2 bytes (u16)
-    pub const _TOTAL_MINTING_FEE: usize = 57;      // 8 bytes (i64) — stat write removed (Fund-owned PDA)
-    pub const _TOTAL_REDEMPTION_FEE: usize = 65;   // 8 bytes (i64) — stat write removed (Fund-owned PDA)
     pub const MIN_SIZE: usize = 150;
 }
 
@@ -2136,20 +2134,16 @@ impl Processor {
         Ok(())
     }
 
-    /// 预测市场交易费收取 (CPI only)
-    /// 
-    /// 仅收取交易费，不修改用户余额。余额调整由 PM Program 完成。
+    /// [DEPRECATED] PM trading fees are now collected off-chain by executor.rs.
+    /// All CPI callers have been removed. This handler rejects any remaining calls.
     fn process_prediction_market_trade_with_fee(
         _program_id: &Pubkey,
         _accounts: &[AccountInfo],
-        trade_amount: u64,
-        is_taker: bool,
+        _trade_amount: u64,
+        _is_taker: bool,
     ) -> ProgramResult {
-        // No-op: PM trading fees are collected off-chain by executor.rs.
-        // This handler is kept for backward compatibility with PM program CPI calls
-        // (DirectTrade/MatchMint/MatchBurn use `if let Err(e) = cpi_trade_with_fee(...)`).
-        msg!("TradeWithFee no-op: amount={}, is_taker={}, fee collected off-chain", trade_amount, is_taker);
-        Ok(())
+        msg!("ERROR: PredictionMarketTradeWithFee is deprecated");
+        Err(ProgramError::InvalidInstructionData)
     }
 
     /// 预测市场结算并扣除手续费 (CPI only)
