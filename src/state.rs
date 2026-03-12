@@ -34,6 +34,9 @@ pub const VAULT_CONFIG_SIZE: usize = 8 + // discriminator
 // Total: 8 + 32 + 32 + 32 + 320 + 32 + 32 + 32 + 8 + 8 + 1 + 32 = 569 bytes ✓
 
 /// UserAccount 账户大小 (bytes)
+///
+/// Layout (153 bytes total, unchanged from V1):
+///   disc(8) + wallet(32) + bump(1) + 7×i64(56) + account_index(1) + oracle_locked_e6(8) + reserved(47)
 pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
     32 + // wallet
     1 + // bump
@@ -44,7 +47,9 @@ pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
     8 + // total_withdrawn_e6
     8 + // last_update_ts
     8 + // spot_locked_e6 (One Account Experience)
-    56; // reserved (was 64, reduced by 8 for spot_locked_e6)
+    1 + // account_index (V2: sub-account isolation)
+    8 + // oracle_locked_e6 (V2: PM Oracle bond)
+    47; // reserved (was 56, reduced by 1+8 for account_index+oracle_locked)
 
 /// Vault 全局配置
 /// 
@@ -120,9 +125,10 @@ impl VaultConfig {
 }
 
 /// 用户账户 (PDA)
-/// Seeds: ["user", wallet.key()]
+/// Seeds: ["user", wallet, &[account_index]]
 /// 
-/// 记录单个用户的保证金状态
+/// 记录单个用户/子账户的保证金状态。
+/// account_index=0 为主账户，1-255 为子账户。
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct UserAccount {
     /// 账户类型标识符
@@ -156,33 +162,45 @@ pub struct UserAccount {
     /// 
     /// One Account Experience: USDC 不再通过 SpotTokenBalance PDA 管理，
     /// 而是直接在 UserAccount 内通过 available ↔ spot_locked 字段搬运。
-    /// 
-    /// 与 locked_margin_e6 (Perp) 对称：
-    ///   - SpotLockUsdc:   available -= X, spot_locked += X
-    ///   - SpotUnlockUsdc: spot_locked -= X, available += X
-    ///   - SpotSettleUsdcTrade: buyer.spot_locked -= X, seller.available += X
-    /// 
-    /// 注意：此字段位于原 reserved 的前 8 字节（offset 89），
-    /// Borsh 兼容性：旧 PDA 的 reserved[0..8] = 0 → spot_locked_e6 = 0（正确初始值）。
     pub spot_locked_e6: i64,
     
-    /// 预留字段 (扩展用) — 从 64 缩减为 56（腾出 8 字节给 spot_locked_e6）
-    pub reserved: [u8; 56],
+    /// Sub-account index (V2).
+    /// 0 = main account, 1-255 = sub-accounts.
+    /// Included in PDA seeds for per-account isolation.
+    /// Borsh-compatible: old PDAs had reserved[8]=0 → account_index=0 (main).
+    pub account_index: u8,
+    
+    /// PM Oracle bond locked amount (e6, V2).
+    /// Used by Exchange program CPI (LockBond/ReleaseBond) for PM Oracle proposals.
+    /// Borsh-compatible: old PDAs had reserved[9..17]=0 → oracle_locked_e6=0.
+    pub oracle_locked_e6: i64,
+    
+    /// 预留字段 (扩展用) — from 56 → 47 (1+8 carved for account_index + oracle_locked)
+    pub reserved: [u8; 47],
 }
 
 impl UserAccount {
     pub const DISCRIMINATOR: u64 = 0x555345525F414343; // "USER_ACC"
     
+    pub const USER_SEED: &'static [u8] = b"user";
+    
+    /// Derive UserAccount PDA address.
+    /// Seeds: ["user", wallet, &[account_index]]
+    pub fn derive_pda(program_id: &Pubkey, wallet: &Pubkey, account_index: u8) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[Self::USER_SEED, wallet.as_ref(), &[account_index]],
+            program_id,
+        )
+    }
+    
     /// 计算权益 (Equity)
     /// 
-    /// equity = 可用余额 + Perp 锁定保证金 + Spot 锁定 USDC + 未实现盈亏
-    /// 
-    /// 注意：此方法仅用于查询/显示，不被任何链上 processor 指令调用。
-    /// 链上余额执行依赖各指令内的逐字段检查（available >= amount 等）。
+    /// equity = 可用余额 + Perp 锁定保证金 + Spot 锁定 USDC + Oracle 锁定 + 未实现盈亏
     pub fn equity(&self) -> i64 {
         self.available_balance_e6
             .saturating_add(self.locked_margin_e6)
             .saturating_add(self.spot_locked_e6)
+            .saturating_add(self.oracle_locked_e6)
             .saturating_add(self.unrealized_pnl_e6)
     }
 }
@@ -287,27 +305,34 @@ impl PredictionMarketUserAccount {
         self.prediction_market_locked_e6 + self.prediction_market_pending_settlement_e6
     }
     
-    /// 锁定资金用于预测市场
-    /// 增加 prediction_market_locked_e6
-    pub fn prediction_market_lock(&mut self, amount: i64, current_ts: i64) {
-        self.prediction_market_locked_e6 += amount;
-        self.prediction_market_total_deposited_e6 += amount;
-        self.last_update_ts = current_ts;
-    }
-    
-    /// 释放预测市场锁定资金
-    pub fn prediction_market_unlock(&mut self, amount: i64, current_ts: i64) -> Result<(), &'static str> {
-        if self.prediction_market_locked_e6 < amount {
-            return Err("Insufficient prediction market locked amount");
-        }
-        self.prediction_market_locked_e6 -= amount;
-        self.prediction_market_total_withdrawn_e6 += amount;
+    /// 锁定资金用于预测市场（checked arithmetic）
+    pub fn prediction_market_lock(&mut self, amount: i64, current_ts: i64) -> Result<(), &'static str> {
+        self.prediction_market_locked_e6 = self.prediction_market_locked_e6
+            .checked_add(amount)
+            .ok_or("Overflow in prediction_market_locked_e6")?;
+        self.prediction_market_total_deposited_e6 = self.prediction_market_total_deposited_e6
+            .checked_add(amount)
+            .ok_or("Overflow in prediction_market_total_deposited_e6")?;
         self.last_update_ts = current_ts;
         Ok(())
     }
     
-    /// 预测市场结算
-    /// 释放锁定并记录结算收益
+    /// 释放预测市场锁定资金（checked arithmetic）
+    pub fn prediction_market_unlock(&mut self, amount: i64, current_ts: i64) -> Result<(), &'static str> {
+        if self.prediction_market_locked_e6 < amount {
+            return Err("Insufficient prediction market locked amount");
+        }
+        self.prediction_market_locked_e6 = self.prediction_market_locked_e6
+            .checked_sub(amount)
+            .ok_or("Underflow in prediction_market_locked_e6")?;
+        self.prediction_market_total_withdrawn_e6 = self.prediction_market_total_withdrawn_e6
+            .checked_add(amount)
+            .ok_or("Overflow in prediction_market_total_withdrawn_e6")?;
+        self.last_update_ts = current_ts;
+        Ok(())
+    }
+    
+    /// 预测市场结算（checked arithmetic）
     pub fn prediction_market_settle(
         &mut self, 
         locked_to_release: i64, 
@@ -317,25 +342,33 @@ impl PredictionMarketUserAccount {
         if self.prediction_market_locked_e6 < locked_to_release {
             return Err("Insufficient prediction market locked amount");
         }
-        self.prediction_market_locked_e6 -= locked_to_release;
-        self.prediction_market_pending_settlement_e6 += settlement_amount;
+        self.prediction_market_locked_e6 = self.prediction_market_locked_e6
+            .checked_sub(locked_to_release)
+            .ok_or("Underflow in prediction_market_locked_e6")?;
+        self.prediction_market_pending_settlement_e6 = self.prediction_market_pending_settlement_e6
+            .checked_add(settlement_amount)
+            .ok_or("Overflow in prediction_market_pending_settlement_e6")?;
         
-        // 计算盈亏
-        let pnl = settlement_amount - locked_to_release;
-        self.prediction_market_realized_pnl_e6 += pnl;
+        let pnl = settlement_amount
+            .checked_sub(locked_to_release)
+            .ok_or("Underflow in pnl calculation")?;
+        self.prediction_market_realized_pnl_e6 = self.prediction_market_realized_pnl_e6
+            .checked_add(pnl)
+            .ok_or("Overflow in prediction_market_realized_pnl_e6")?;
         
         self.last_update_ts = current_ts;
         Ok(())
     }
     
-    /// 领取预测市场结算收益
-    /// 清空 prediction_market_pending_settlement_e6
-    pub fn prediction_market_claim_settlement(&mut self, current_ts: i64) -> i64 {
+    /// 领取预测市场结算收益（checked arithmetic）
+    pub fn prediction_market_claim_settlement(&mut self, current_ts: i64) -> Result<i64, &'static str> {
         let amount = self.prediction_market_pending_settlement_e6;
         self.prediction_market_pending_settlement_e6 = 0;
-        self.prediction_market_total_withdrawn_e6 += amount;
+        self.prediction_market_total_withdrawn_e6 = self.prediction_market_total_withdrawn_e6
+            .checked_add(amount)
+            .ok_or("Overflow in prediction_market_total_withdrawn_e6")?;
         self.last_update_ts = current_ts;
-        amount
+        Ok(amount)
     }
 }
 
@@ -349,8 +382,8 @@ impl PredictionMarketUserAccount {
 // Design: DYNAMIC-TOKEN-BALANCE-ARCHITECTURE.md (8 audit rounds, 23 findings)
 // Decision: Plan A — SpotUserAccount completely deleted, no header, no sequence check.
 //
-// Each (wallet, token_index) pair gets its own PDA, auto-created on first use.
-// PDA seeds: ["spot_balance", wallet, token_index.to_le_bytes()]
+// Each (wallet, account_index, token_index) triple gets its own PDA, auto-created on first use.
+// PDA seeds: ["spot_balance", wallet, &[account_index], token_index.to_le_bytes()]
 
 /// SpotTokenBalance discriminator — "SPTK_BAL" in ASCII hex
 pub const SPOT_TOKEN_BALANCE_DISCRIMINATOR: u64 = 0x5350544B5F42414C;
@@ -431,17 +464,31 @@ impl SpotTokenBalance {
 
 /// Derive SpotTokenBalance PDA address
 ///
-/// Seeds: ["spot_balance", wallet, token_index.to_le_bytes()]
+/// Seeds: ["spot_balance", wallet, account_index, token_index.to_le_bytes()]
+/// account_index ensures sub-accounts have isolated Spot balances.
 /// Returns (pda_address, bump)
 pub fn derive_spot_token_balance_pda(
     program_id: &Pubkey,
     wallet: &Pubkey,
     token_index: u16,
 ) -> (Pubkey, u8) {
+    derive_spot_token_balance_pda_with_index(program_id, wallet, 0, token_index)
+}
+
+/// Derive SpotTokenBalance PDA address with explicit account_index.
+///
+/// Seeds: ["spot_balance", wallet, &[account_index], token_index.to_le_bytes()]
+pub fn derive_spot_token_balance_pda_with_index(
+    program_id: &Pubkey,
+    wallet: &Pubkey,
+    account_index: u8,
+    token_index: u16,
+) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[
             SPOT_BALANCE_SEED,
             wallet.as_ref(),
+            &[account_index],
             &token_index.to_le_bytes(),
         ],
         program_id,
@@ -603,11 +650,13 @@ mod tests {
             total_withdrawn_e6: 0,
             last_update_ts: 0,
             spot_locked_e6: 300_000_000,
-            reserved: [0; 56],
+            account_index: 0,
+            oracle_locked_e6: 100_000_000,
+            reserved: [0; 47],
         };
         
-        // equity = available(1000) + locked_margin(500) + spot_locked(300) + unrealized_pnl(200) = 2000
-        assert_eq!(account.equity(), 2000_000_000);
+        // equity = available(1000) + locked_margin(500) + spot_locked(300) + oracle_locked(100) + upnl(200) = 2100
+        assert_eq!(account.equity(), 2100_000_000);
     }
     
     #[test]
@@ -623,11 +672,26 @@ mod tests {
             total_withdrawn_e6: 0,
             last_update_ts: 0,
             spot_locked_e6: 0,
-            reserved: [0; 56],
+            account_index: 0,
+            oracle_locked_e6: 0,
+            reserved: [0; 47],
         };
         let serialized = borsh::to_vec(&account).unwrap();
-        // 8(disc) + 32(wallet) + 1(bump) + 7*8(i64 fields) + 56(reserved) = 153
+        // 8(disc) + 32(wallet) + 1(bump) + 7*i64(56) + 1(account_index) + 8(oracle_locked) + 47(reserved) = 153
         assert_eq!(serialized.len(), 153, "UserAccount size must remain 153 bytes");
+    }
+    
+    #[test]
+    fn test_user_account_derive_pda() {
+        let program_id = Pubkey::new_unique();
+        let wallet = Pubkey::new_unique();
+        
+        let (pda_main, _) = UserAccount::derive_pda(&program_id, &wallet, 0);
+        let (pda_sub1, _) = UserAccount::derive_pda(&program_id, &wallet, 1);
+        let (pda_main2, _) = UserAccount::derive_pda(&program_id, &wallet, 0);
+        
+        assert_ne!(pda_main, pda_sub1, "Different account_index → different PDA");
+        assert_eq!(pda_main, pda_main2, "Same inputs → same PDA");
     }
 
     #[test]
@@ -687,7 +751,7 @@ mod tests {
         let mut account = PredictionMarketUserAccount::new(wallet, 255, 1000);
         
         // Lock funds
-        account.prediction_market_lock(100_000_000, 1001);
+        account.prediction_market_lock(100_000_000, 1001).unwrap();
         assert_eq!(account.prediction_market_locked_e6, 100_000_000);
         assert_eq!(account.prediction_market_total_deposited_e6, 100_000_000);
         
@@ -706,7 +770,7 @@ mod tests {
         let mut account = PredictionMarketUserAccount::new(wallet, 255, 1000);
         
         // Lock 100 USDC
-        account.prediction_market_lock(100_000_000, 1001);
+        account.prediction_market_lock(100_000_000, 1001).unwrap();
         
         // Settle with profit (YES wins, get 100 USDC back)
         account.prediction_market_settle(100_000_000, 100_000_000, 1002).unwrap();
@@ -715,7 +779,7 @@ mod tests {
         assert_eq!(account.prediction_market_realized_pnl_e6, 0); // Break even
         
         // Claim
-        let claimed = account.prediction_market_claim_settlement(1003);
+        let claimed = account.prediction_market_claim_settlement(1003).unwrap();
         assert_eq!(claimed, 100_000_000);
         assert_eq!(account.prediction_market_pending_settlement_e6, 0);
     }
@@ -726,7 +790,7 @@ mod tests {
         let mut account = PredictionMarketUserAccount::new(wallet, 255, 1000);
         
         // Lock 50 USDC (bought YES at $0.50)
-        account.prediction_market_lock(50_000_000, 1001);
+        account.prediction_market_lock(50_000_000, 1001).unwrap();
         
         // Settle with profit (YES wins, get 100 USDC back - 100 tokens * $1)
         account.prediction_market_settle(50_000_000, 100_000_000, 1002).unwrap();

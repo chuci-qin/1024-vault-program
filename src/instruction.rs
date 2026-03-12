@@ -32,9 +32,12 @@ pub enum VaultInstruction {
     /// 
     /// Accounts:
     /// 0. `[signer]` User
-    /// 1. `[writable]` UserAccount PDA
+    /// 1. `[writable]` UserAccount PDA (seeds: ["user", wallet, &[account_index]])
     /// 2. `[]` System Program
-    InitializeUser,
+    InitializeUser {
+        /// Sub-account index (0=main, 1-255=sub)
+        account_index: u8,
+    },
 
     /// 入金
     /// 
@@ -407,13 +410,8 @@ pub enum VaultInstruction {
 
     /// Relayer 代理入金 (Admin/Relayer only)
     /// 
-    /// 用途：当用户在 Solana 主网/Arbitrum 等链转账后，
-    /// 由授权的 Relayer 代替用户在 1024Chain 上入金到 Vault
-    /// 
-    /// 特性：
-    /// - 如果用户 UserAccount 不存在，会自动创建
-    /// - 仅 Admin 可调用 (测试网自由入金)
-    /// - 不涉及实际 Token Transfer（余额凭证模式）
+    /// PDA seeds: ["user", user_wallet, &[account_index]]
+    /// Deposits always target main account (account_index=0).
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
@@ -425,17 +423,13 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         /// 入金金额 (e6)
         amount: u64,
+        /// Sub-account index (typically 0 for deposits)
+        account_index: u8,
     },
 
     /// Relayer 代理出金 (Admin/Relayer only)
     /// 
-    /// 用途：用户请求出金后，Relayer 在 1024Chain 上扣除余额，
-    /// 然后在 Solana 主网/Arbitrum 等链上给用户转账
-    /// 
-    /// 安全性：
-    /// - 仅 Admin 可调用
-    /// - 必须验证用户有足够余额
-    /// - 出金后 Relayer 负责在对应链完成转账
+    /// PDA seeds: ["user", user_wallet, &[account_index]]
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
@@ -446,6 +440,8 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         /// 出金金额 (e6)
         amount: u64,
+        /// Sub-account index
+        account_index: u8,
     },
 
     // =========================================================================
@@ -475,6 +471,8 @@ pub enum VaultInstruction {
         token_index: u16,
         /// 入金金额 (e6 或原生精度)
         amount: u64,
+        /// Sub-account index (0=main, 1-255=sub)
+        account_index: u8,
     },
 
     /// Spot Token 出金 (用户直接调用)
@@ -493,6 +491,8 @@ pub enum VaultInstruction {
         token_index: u16,
         /// 出金金额
         amount: u64,
+        /// Sub-account index (0=main, 1-255=sub)
+        account_index: u8,
     },
 
     /// Spot 锁定余额 (CPI only - 挂单时)
@@ -508,6 +508,8 @@ pub enum VaultInstruction {
         token_index: u16,
         /// 锁定金额
         amount: u64,
+        /// Sub-account index (0=main, 1-255=sub)
+        account_index: u8,
     },
 
     /// Spot 解锁余额 (CPI only - 撤单时)
@@ -523,6 +525,8 @@ pub enum VaultInstruction {
         token_index: u16,
         /// 解锁金额
         amount: u64,
+        /// Sub-account index (0=main, 1-255=sub)
+        account_index: u8,
     },
 
     /// [DEPRECATED] SpotSettleTrade (CPI-only) — use RelayerSpotSettleTrade instead.
@@ -553,6 +557,8 @@ pub enum VaultInstruction {
         token_index: u16,
         /// 入金金额
         amount: u64,
+        /// Sub-account index (0=main, 1-255=sub)
+        account_index: u8,
     },
 
     /// Relayer 代理 Spot 出金 (Admin/Relayer only)
@@ -568,6 +574,8 @@ pub enum VaultInstruction {
         token_index: u16,
         /// 出金金额
         amount: u64,
+        /// Sub-account index (0=main, 1-255=sub)
+        account_index: u8,
     },
 
     // =========================================================================
@@ -608,15 +616,19 @@ pub enum VaultInstruction {
         taker_is_buy: bool,
         /// 序列号 (防止重复结算)
         sequence: u64,
+        /// Maker sub-account index (0=main, 1-255=sub)
+        maker_account_index: u8,
+        /// Taker sub-account index (0=main, 1-255=sub)
+        taker_account_index: u8,
     },
 
     /// 从 UserAccount 划转 USDC 到 SpotTokenBalance (Admin/Relayer only)
     /// 
-    /// 统一账户体验：Spot 买入前，将 USDC 从 Perp 主账户划转到 Spot USDC 余额
+    /// PDA seeds: ["user", user_wallet, &[account_index]]
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
-    /// 1. `[writable]` UserAccount PDA (seed: ["user", wallet])
+    /// 1. `[writable]` UserAccount PDA
     /// 2. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", wallet, 0u16]) — USDC
     /// 3. `[]` VaultConfig
     /// 4. `[]` System Program (for auto-init SpotTokenBalance)
@@ -625,22 +637,26 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         /// 划转金额 (e6)
         amount: u64,
+        /// Sub-account index
+        account_index: u8,
     },
 
     /// 从 SpotTokenBalance 划转 USDC 到 UserAccount (Admin/Relayer only)
     /// 
-    /// 统一账户体验：Spot 卖出后，将 USDC 从 Spot 余额划转回 Perp 主账户
+    /// PDA seeds: ["user", user_wallet, &[account_index]]
     /// 
     /// Accounts:
     /// 0. `[signer]` Admin/Relayer
     /// 1. `[writable]` SpotTokenBalance PDA (seeds: ["spot_balance", wallet, 0u16]) — USDC
-    /// 2. `[writable]` UserAccount PDA (seed: ["user", wallet])
+    /// 2. `[writable]` UserAccount PDA
     /// 3. `[]` VaultConfig
     SpotReleaseToVault {
         /// 用户钱包地址
         user_wallet: Pubkey,
         /// 划转金额 (e6)
         amount: u64,
+        /// Sub-account index
+        account_index: u8,
     },
 
     // =========================================================================
@@ -676,6 +692,10 @@ pub enum VaultInstruction {
         transfer_type: u8,
         /// 业务关联哈希 (用于幂等性)
         reference_hash: [u8; 32],
+        /// Source sub-account index
+        from_account_index: u8,
+        /// Destination sub-account index
+        to_account_index: u8,
     },
 
     /// 初始化定时支付授权 PDA (链上存证)
@@ -760,6 +780,8 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         /// 增加的金额 (e6)
         amount: u64,
+        /// Sub-account index
+        account_index: u8,
     },
 
     /// 预测市场结算直接到可用余额 (CPI only)
@@ -809,6 +831,8 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         /// 出金金额 (e6)
         amount: u64,
+        /// Sub-account index
+        account_index: u8,
     },
 
     // =========================================================================
@@ -871,6 +895,10 @@ pub enum VaultInstruction {
         sequence: u64,
         /// Base token 索引 (e.g., BTC=1), 用于 auto-init buyer base PDA
         base_token_index: u16,
+        /// Buyer sub-account index (0=main, 1-255=sub)
+        buyer_account_index: u8,
+        /// Seller sub-account index (0=main, 1-255=sub)
+        seller_account_index: u8,
     },
 
     /// Index 49: PM 结算到 available_balance 并收取手续费（一步完成）
@@ -880,6 +908,78 @@ pub enum VaultInstruction {
     PredictionMarketSettleToAvailableWithFee {
         locked_amount: u64,
         settlement_amount: u64,
+    },
+
+    // =========================================================================
+    // PM Oracle Bond Instructions (V2 — Exchange Program CPI)
+    // =========================================================================
+
+    /// Lock bond for PM Oracle proposal (CPI only — Exchange Program)
+    ///
+    /// Moves USDC from available_balance to oracle_locked_e6.
+    /// Called by Exchange program when user proposes or challenges an Oracle result.
+    ///
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` Caller Program (must be authorized — Exchange Program)
+    LockBond {
+        /// Bond amount (e6)
+        amount_e6: u64,
+    },
+
+    /// Release bond from PM Oracle (CPI only — Exchange Program)
+    ///
+    /// Moves USDC from oracle_locked_e6 back to available_balance.
+    /// Called when an Oracle proposal is finalized or a dispute is resolved.
+    ///
+    /// Accounts:
+    /// 0. `[]` VaultConfig
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` Caller Program (must be authorized — Exchange Program)
+    ReleaseBond {
+        /// Bond amount (e6)
+        amount_e6: u64,
+    },
+
+    // =========================================================================
+    // Sync Instructions (V2 — DB-First Architecture)
+    // =========================================================================
+
+    /// Index 52: Sync UserAccount from DB to chain (Relayer-only)
+    ///
+    /// Sets UserAccount PDA fields to exact DB values (set-to-value, not add/subtract).
+    /// Used by recording_queue worker to mirror DB state to chain.
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` UserAccount PDA
+    /// 2. `[]` VaultConfig
+    /// 3. `[]` System Program (for auto-init if PDA doesn't exist)
+    SyncUserAccount {
+        user_wallet: Pubkey,
+        account_index: u8,
+        available_balance_e6: i64,
+        locked_margin_e6: i64,
+        spot_locked_e6: i64,
+    },
+
+    /// Index 53: Sync SpotTokenBalance from DB to chain (Relayer-only)
+    ///
+    /// Sets SpotTokenBalance PDA fields to exact DB values.
+    /// Used by recording_queue worker to mirror DB state to chain.
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Admin/Relayer
+    /// 1. `[writable]` SpotTokenBalance PDA
+    /// 2. `[]` VaultConfig
+    /// 3. `[]` System Program (for auto-init if PDA doesn't exist)
+    SyncSpotTokenBalance {
+        user_wallet: Pubkey,
+        account_index: u8,
+        token_index: u16,
+        available_e6: i64,
+        locked_e6: i64,
     },
 }
 

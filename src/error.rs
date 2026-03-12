@@ -122,6 +122,10 @@ pub enum VaultError {
     /// Insufficient spot locked balance
     #[error("Insufficient spot locked balance")]
     InsufficientSpotLocked,
+
+    /// Insufficient oracle bond balance
+    #[error("Insufficient oracle bond balance")]
+    InsufficientOracleBond,
 }
 
 impl From<VaultError> for ProgramError {

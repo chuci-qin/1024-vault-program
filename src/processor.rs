@@ -156,41 +156,33 @@ impl Processor {
                     fund_program,
                 )
             }
-            VaultInstruction::InitializeUser => {
+            VaultInstruction::InitializeUser { account_index } => {
                 msg!("Instruction: InitializeUser");
-                Self::process_initialize_user(program_id, accounts)
+                Self::process_initialize_user(program_id, accounts, account_index)
             }
             VaultInstruction::Deposit { amount } => {
                 msg!("Instruction: Deposit");
-                Self::process_deposit(accounts, amount)
+                Self::process_deposit(program_id, accounts, amount)
             }
             VaultInstruction::Withdraw { amount } => {
                 msg!("Instruction: Withdraw");
-                Self::process_withdraw(accounts, amount)
+                Self::process_withdraw(program_id, accounts, amount)
             }
-            VaultInstruction::LockMargin { amount } => {
-                msg!("Instruction: LockMargin");
-                Self::process_lock_margin(accounts, amount)
+            VaultInstruction::LockMargin { .. } => {
+                msg!("Instruction: LockMargin — DEPRECATED, rejecting");
+                Err(ProgramError::InvalidInstructionData)
             }
-            VaultInstruction::ReleaseMargin { amount } => {
-                msg!("Instruction: ReleaseMargin");
-                Self::process_release_margin(accounts, amount)
+            VaultInstruction::ReleaseMargin { .. } => {
+                msg!("Instruction: ReleaseMargin — DEPRECATED, rejecting");
+                Err(ProgramError::InvalidInstructionData)
             }
-            VaultInstruction::ClosePositionSettle {
-                margin_to_release,
-                realized_pnl,
-                fee,
-            } => {
-                msg!("Instruction: ClosePositionSettle");
-                Self::process_close_position_settle(accounts, margin_to_release, realized_pnl, fee)
+            VaultInstruction::ClosePositionSettle { .. } => {
+                msg!("Instruction: ClosePositionSettle — DEPRECATED, rejecting");
+                Err(ProgramError::InvalidInstructionData)
             }
-            VaultInstruction::LiquidatePosition {
-                margin,
-                user_remainder,
-                liquidation_penalty,
-            } => {
-                msg!("Instruction: LiquidatePosition");
-                Self::process_liquidate_position(program_id, accounts, margin, user_remainder, liquidation_penalty)
+            VaultInstruction::LiquidatePosition { .. } => {
+                msg!("Instruction: LiquidatePosition — DEPRECATED, rejecting");
+                Err(ProgramError::InvalidInstructionData)
             }
             VaultInstruction::AddAuthorizedCaller { caller } => {
                 msg!("Instruction: AddAuthorizedCaller");
@@ -264,13 +256,13 @@ impl Processor {
             }
             
             // Relayer 指令
-            VaultInstruction::RelayerDeposit { user_wallet, amount } => {
+            VaultInstruction::RelayerDeposit { user_wallet, amount, account_index } => {
                 msg!("Instruction: RelayerDeposit");
-                Self::process_relayer_deposit(program_id, accounts, user_wallet, amount)
+                Self::process_relayer_deposit(program_id, accounts, user_wallet, amount, account_index)
             }
-            VaultInstruction::RelayerWithdraw { user_wallet, amount } => {
+            VaultInstruction::RelayerWithdraw { user_wallet, amount, account_index } => {
                 msg!("Instruction: RelayerWithdraw");
-                Self::process_relayer_withdraw(program_id, accounts, user_wallet, amount)
+                Self::process_relayer_withdraw(program_id, accounts, user_wallet, amount, account_index)
             }
             
             // Spot 交易指令
@@ -278,19 +270,19 @@ impl Processor {
                 msg!("Instruction: Deprecated_InitializeSpotUser");
                 Self::process_initialize_spot_user(program_id, accounts)
             }
-            VaultInstruction::SpotDeposit { token_index, amount } => {
+            VaultInstruction::SpotDeposit { token_index, amount, account_index } => {
                 msg!("Instruction: SpotDeposit");
-                Self::process_spot_deposit(program_id, accounts, token_index, amount)
+                Self::process_spot_deposit(program_id, accounts, token_index, amount, account_index)
             }
-            VaultInstruction::SpotWithdraw { token_index, amount } => {
+            VaultInstruction::SpotWithdraw { token_index, amount, account_index } => {
                 msg!("Instruction: SpotWithdraw");
-                Self::process_spot_withdraw(program_id, accounts, token_index, amount)
+                Self::process_spot_withdraw(program_id, accounts, token_index, amount, account_index)
             }
-            VaultInstruction::SpotLockBalance { token_index, amount } => {
+            VaultInstruction::SpotLockBalance { token_index, amount, account_index: _ } => {
                 msg!("Instruction: SpotLockBalance");
                 Self::process_spot_lock_balance(program_id, accounts, token_index, amount)
             }
-            VaultInstruction::SpotUnlockBalance { token_index, amount } => {
+            VaultInstruction::SpotUnlockBalance { token_index, amount, account_index: _ } => {
                 msg!("Instruction: SpotUnlockBalance");
                 Self::process_spot_unlock_balance(program_id, accounts, token_index, amount)
             }
@@ -298,35 +290,36 @@ impl Processor {
                 msg!("Instruction: Deprecated_SpotSettleTrade");
                 Self::process_spot_settle_trade(accounts, _is_buy, _base_token_index, _quote_token_index, _base_amount, _quote_amount, _sequence)
             }
-            VaultInstruction::RelayerSpotDeposit { user_wallet, token_index, amount } => {
+            VaultInstruction::RelayerSpotDeposit { user_wallet, token_index, amount, account_index } => {
                 msg!("Instruction: RelayerSpotDeposit");
-                Self::process_relayer_spot_deposit(program_id, accounts, user_wallet, token_index, amount)
+                Self::process_relayer_spot_deposit(program_id, accounts, user_wallet, token_index, amount, account_index)
             }
-            VaultInstruction::RelayerSpotWithdraw { user_wallet, token_index, amount } => {
+            VaultInstruction::RelayerSpotWithdraw { user_wallet, token_index, amount, account_index } => {
                 msg!("Instruction: RelayerSpotWithdraw");
-                Self::process_relayer_spot_withdraw(program_id, accounts, user_wallet, token_index, amount)
+                Self::process_relayer_spot_withdraw(program_id, accounts, user_wallet, token_index, amount, account_index)
             }
             
             // Spot 统一账户指令 (2025-12-31 新增)
             VaultInstruction::RelayerSpotSettleTrade { 
                 maker_wallet, taker_wallet, base_token_index, quote_token_index,
                 base_amount_e6, quote_amount_e6, maker_fee_e6, taker_fee_e6,
-                taker_is_buy, sequence 
+                taker_is_buy, sequence, maker_account_index, taker_account_index,
             } => {
                 msg!("Instruction: RelayerSpotSettleTrade");
                 Self::process_relayer_spot_settle_trade(
                     program_id, accounts, maker_wallet, taker_wallet,
                     base_token_index, quote_token_index, base_amount_e6, quote_amount_e6,
-                    maker_fee_e6, taker_fee_e6, taker_is_buy, sequence
+                    maker_fee_e6, taker_fee_e6, taker_is_buy, sequence,
+                    maker_account_index, taker_account_index,
                 )
             }
-            VaultInstruction::SpotAllocateFromVault { user_wallet, amount } => {
+            VaultInstruction::SpotAllocateFromVault { user_wallet, amount, account_index } => {
                 msg!("Instruction: SpotAllocateFromVault");
-                Self::process_spot_allocate_from_vault(program_id, accounts, user_wallet, amount)
+                Self::process_spot_allocate_from_vault(program_id, accounts, user_wallet, amount, account_index)
             }
-            VaultInstruction::SpotReleaseToVault { user_wallet, amount } => {
+            VaultInstruction::SpotReleaseToVault { user_wallet, amount, account_index } => {
                 msg!("Instruction: SpotReleaseToVault");
-                Self::process_spot_release_to_vault(program_id, accounts, user_wallet, amount)
+                Self::process_spot_release_to_vault(program_id, accounts, user_wallet, amount, account_index)
             }
 
             // =========================================================================
@@ -340,10 +333,13 @@ impl Processor {
                 fee,
                 transfer_type,
                 reference_hash,
+                from_account_index,
+                to_account_index,
             } => {
                 msg!("Instruction: RelayerInternalTransfer");
                 Self::process_relayer_internal_transfer(
-                    program_id, accounts, from_wallet, to_wallet, amount, fee, transfer_type, reference_hash
+                    program_id, accounts, from_wallet, to_wallet, amount, fee, transfer_type, reference_hash,
+                    from_account_index, to_account_index,
                 )
             }
             VaultInstruction::InitRecurringAuth {
@@ -375,9 +371,9 @@ impl Processor {
                 msg!("Instruction: CancelRecurringAuth");
                 Self::process_cancel_recurring_auth(program_id, accounts, payer, payee)
             }
-            VaultInstruction::CreditUserBalance { user_wallet, amount } => {
+            VaultInstruction::CreditUserBalance { user_wallet, amount, account_index } => {
                 msg!("Instruction: CreditUserBalance");
-                Self::process_credit_user_balance(program_id, accounts, user_wallet, amount)
+                Self::process_credit_user_balance(program_id, accounts, user_wallet, amount, account_index)
             }
             VaultInstruction::PredictionMarketSettleToAvailable { locked_amount, settlement_amount } => {
                 msg!("Instruction: PredictionMarketSettleToAvailable");
@@ -387,9 +383,9 @@ impl Processor {
                 msg!("Instruction: RelayerPredictionMarketClaimSettlement");
                 Self::process_relayer_prediction_market_claim_settlement(accounts)
             }
-            VaultInstruction::RelayerWithdrawAndTransfer { user_wallet, amount } => {
+            VaultInstruction::RelayerWithdrawAndTransfer { user_wallet, amount, account_index } => {
                 msg!("Instruction: RelayerWithdrawAndTransfer");
-                Self::process_relayer_withdraw_and_transfer(program_id, accounts, user_wallet, amount)
+                Self::process_relayer_withdraw_and_transfer(program_id, accounts, user_wallet, amount, account_index)
             }
             // One Account Experience — Spot USDC 统一管理
             VaultInstruction::SpotLockUsdc { amount } => {
@@ -400,13 +396,29 @@ impl Processor {
                 msg!("Instruction: SpotUnlockUsdc");
                 Self::process_spot_unlock_usdc(accounts, amount)
             }
-            VaultInstruction::SpotSettleUsdcTrade { buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index } => {
+            VaultInstruction::SpotSettleUsdcTrade { buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index, buyer_account_index, seller_account_index } => {
                 msg!("Instruction: SpotSettleUsdcTrade");
-                Self::process_spot_settle_usdc_trade(program_id, accounts, buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index)
+                Self::process_spot_settle_usdc_trade(program_id, accounts, buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index, buyer_account_index, seller_account_index)
             }
             VaultInstruction::PredictionMarketSettleToAvailableWithFee { locked_amount, settlement_amount } => {
                 msg!("Instruction: PredictionMarketSettleToAvailableWithFee");
                 Self::process_prediction_market_settle_to_available_with_fee(program_id, accounts, locked_amount, settlement_amount)
+            }
+            VaultInstruction::LockBond { amount_e6 } => {
+                msg!("Instruction: LockBond");
+                Self::process_lock_bond(accounts, amount_e6)
+            }
+            VaultInstruction::ReleaseBond { amount_e6 } => {
+                msg!("Instruction: ReleaseBond");
+                Self::process_release_bond(accounts, amount_e6)
+            }
+            VaultInstruction::SyncUserAccount { user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6 } => {
+                msg!("Instruction: SyncUserAccount");
+                Self::process_sync_user_account(program_id, accounts, user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6)
+            }
+            VaultInstruction::SyncSpotTokenBalance { user_wallet, account_index, token_index, available_e6, locked_e6 } => {
+                msg!("Instruction: SyncSpotTokenBalance");
+                Self::process_sync_spot_token_balance(program_id, accounts, user_wallet, account_index, token_index, available_e6, locked_e6)
             }
         }
     }
@@ -480,7 +492,7 @@ impl Processor {
     }
 
     /// 处理初始化用户账户
-    fn process_initialize_user(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    fn process_initialize_user(program_id: &Pubkey, accounts: &[AccountInfo], account_index: u8) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let user = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
@@ -488,7 +500,7 @@ impl Processor {
 
         assert_signer(user)?;
 
-        let (user_account_pda, bump) = Pubkey::find_program_address(&[b"user", user.key.as_ref()], program_id);
+        let (user_account_pda, bump) = UserAccount::derive_pda(program_id, user.key, account_index);
 
         if user_account_info.key != &user_account_pda {
             return Err(VaultError::InvalidPda.into());
@@ -507,7 +519,7 @@ impl Processor {
                 program_id,
             ),
             &[user.clone(), user_account_info.clone()],
-            &[&[b"user", user.key.as_ref(), &[bump]]],
+            &[&[b"user", user.key.as_ref(), &[account_index], &[bump]]],
         )?;
 
         let user_account = UserAccount {
@@ -521,7 +533,9 @@ impl Processor {
             total_withdrawn_e6: 0,
             last_update_ts: 0,
             spot_locked_e6: 0,
-            reserved: [0; 56],
+            account_index,
+            oracle_locked_e6: 0,
+            reserved: [0; 47],
         };
 
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
@@ -530,8 +544,8 @@ impl Processor {
         Ok(())
     }
 
-    /// 处理入金
-    fn process_deposit(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+    /// 处理入金（V1-V4: PDA + token_account + vault_config 验证）
+    fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let user = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
@@ -548,19 +562,41 @@ impl Processor {
             return Err(VaultError::InvalidAmount.into());
         }
 
+        // V-3: Verify VaultConfig PDA
+        let (expected_vault_config_pda, _) = Pubkey::find_program_address(&[b"vault_config"], program_id);
+        if vault_config_info.key != &expected_vault_config_pda {
+            msg!("❌ Invalid VaultConfig PDA");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
         let mut vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
         if vault_config.is_paused {
             return Err(VaultError::VaultPaused.into());
         }
 
-        // SPL Token Transfer (用户 → Vault) - 使用 token_compat 支持 Token-2022
+        // V-2: Verify vault_token_account matches VaultConfig
+        if vault_token_account.key != &vault_config.vault_token_account {
+            msg!("❌ Invalid vault token account");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        // V-1: Verify UserAccount PDA
+        let user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+        let (expected_user_pda, _) = UserAccount::derive_pda(program_id, user.key, user_account.account_index);
+        if user_account_info.key != &expected_user_pda {
+            msg!("❌ Invalid UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+        drop(user_account);
+
+        // SPL Token Transfer (用户 → Vault)
         token_compat::transfer(
             token_program,
             user_token_account,
             vault_token_account,
             user,
             amount,
-            None, // 用户签名，不需要 PDA seeds
+            None,
         )?;
 
         // 更新UserAccount
@@ -578,8 +614,8 @@ impl Processor {
         Ok(())
     }
 
-    /// 处理出金
-    fn process_withdraw(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
+    /// 处理出金（V1-V4: PDA + token_account + vault_config 验证）
+    fn process_withdraw(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let user = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
@@ -595,13 +631,33 @@ impl Processor {
             return Err(VaultError::InvalidAmount.into());
         }
 
+        // V-3: Verify VaultConfig PDA
+        let (expected_vault_config_pda, vault_config_bump) =
+            Pubkey::find_program_address(&[b"vault_config"], program_id);
+        if vault_config_info.key != &expected_vault_config_pda {
+            msg!("❌ Invalid VaultConfig PDA");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
         if vault_config.is_paused {
             return Err(VaultError::VaultPaused.into());
         }
 
+        // V-2: Verify vault_token_account matches VaultConfig
+        if vault_token_account.key != &vault_config.vault_token_account {
+            msg!("❌ Invalid vault token account");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        // V-1: Verify UserAccount PDA
         let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        
+        let (expected_user_pda, _) = UserAccount::derive_pda(program_id, user.key, user_account.account_index);
+        if user_account_info.key != &expected_user_pda {
+            msg!("❌ Invalid UserAccount PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
         if user_account.available_balance_e6 < amount as i64 {
             return Err(VaultError::InsufficientBalance.into());
         }
@@ -611,10 +667,7 @@ impl Processor {
         user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
-        // SPL Token Transfer (Vault → 用户) - 使用 token_compat 支持 Token-2022
-        let (_vault_config_pda, vault_config_bump) =
-            Pubkey::find_program_address(&[b"vault_config"], vault_config_info.owner);
-
+        // SPL Token Transfer (Vault → 用户)
         token_compat::transfer(
             token_program,
             vault_token_account,
@@ -1197,7 +1250,8 @@ impl Processor {
 
         // 增加 PredictionMarketUserAccount
         let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
-        pm_user_account.prediction_market_lock(amount as i64, solana_program::clock::Clock::get()?.unix_timestamp);
+        pm_user_account.prediction_market_lock(amount as i64, solana_program::clock::Clock::get()?.unix_timestamp)
+            .map_err(|_| VaultError::Overflow)?;
         pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
 
         msg!("Prediction market locked {} e6 for {}", amount, user_account.wallet);
@@ -1354,7 +1408,7 @@ impl Processor {
         }
         let claim_amount = pm_user_account.prediction_market_claim_settlement(
             solana_program::clock::Clock::get()?.unix_timestamp
-        );
+        ).map_err(|_| VaultError::Overflow)?;
         pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
 
         if claim_amount <= 0 {
@@ -1403,7 +1457,7 @@ impl Processor {
                      pm_user_account.prediction_market_locked_e6, locked_amount);
                 return Err(VaultError::InsufficientMargin.into());
             }
-            pm_user_account.prediction_market_locked_e6 -= locked_amount as i64;
+            pm_user_account.prediction_market_locked_e6 = checked_sub(pm_user_account.prediction_market_locked_e6, locked_amount as i64)?;
         }
         pm_user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
@@ -1446,7 +1500,7 @@ impl Processor {
         let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
         let claim_amount = pm_user_account.prediction_market_claim_settlement(
             solana_program::clock::Clock::get()?.unix_timestamp
-        );
+        ).map_err(|_| VaultError::Overflow)?;
         pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
 
         if claim_amount <= 0 {
@@ -1502,7 +1556,7 @@ impl Processor {
             return Err(VaultError::InsufficientMargin.into());
         }
 
-        pm_user_account.prediction_market_locked_e6 -= release_amount;
+        pm_user_account.prediction_market_locked_e6 = checked_sub(pm_user_account.prediction_market_locked_e6, release_amount)?;
         pm_user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
 
@@ -1532,6 +1586,7 @@ impl Processor {
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
@@ -1568,10 +1623,7 @@ impl Processor {
         }
 
         // 3. 验证 UserAccount PDA
-        let (user_account_pda, bump) = Pubkey::find_program_address(
-            &[b"user", user_wallet.as_ref()],
-            program_id
-        );
+        let (user_account_pda, bump) = UserAccount::derive_pda(program_id, &user_wallet, account_index);
         if user_account_info.key != &user_account_pda {
             msg!("❌ Invalid UserAccount PDA");
             return Err(VaultError::InvalidPda.into());
@@ -1594,7 +1646,7 @@ impl Processor {
                     program_id,
                 ),
                 &[admin.clone(), user_account_info.clone(), system_program.clone()],
-                &[&[b"user", user_wallet.as_ref(), &[bump]]],
+                &[&[b"user", user_wallet.as_ref(), &[account_index], &[bump]]],
             )?;
 
             // 初始化新账户
@@ -1609,7 +1661,9 @@ impl Processor {
                 total_withdrawn_e6: 0,
                 last_update_ts: solana_program::clock::Clock::get()?.unix_timestamp,
                 spot_locked_e6: 0,
-                reserved: [0; 56],
+                account_index,
+                oracle_locked_e6: 0,
+                reserved: [0; 47],
             };
             user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
@@ -1652,6 +1706,7 @@ impl Processor {
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
@@ -1686,10 +1741,7 @@ impl Processor {
         }
 
         // 3. 验证 UserAccount PDA
-        let (user_account_pda, _bump) = Pubkey::find_program_address(
-            &[b"user", user_wallet.as_ref()],
-            program_id
-        );
+        let (user_account_pda, _bump) = UserAccount::derive_pda(program_id, &user_wallet, account_index);
         if user_account_info.key != &user_account_pda {
             msg!("❌ Invalid UserAccount PDA");
             return Err(VaultError::InvalidPda.into());
@@ -1746,6 +1798,7 @@ impl Processor {
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
@@ -1780,10 +1833,7 @@ impl Processor {
             return Err(VaultError::InvalidAmount.into());
         }
 
-        let (user_account_pda, _bump) = Pubkey::find_program_address(
-            &[b"user", user_wallet.as_ref()],
-            program_id
-        );
+        let (user_account_pda, _bump) = UserAccount::derive_pda(program_id, &user_wallet, account_index);
         if user_account_info.key != &user_account_pda {
             msg!("❌ Invalid UserAccount PDA");
             return Err(VaultError::InvalidPda.into());
@@ -1985,7 +2035,8 @@ impl Processor {
 
         // 7. 增加 PMUserAccount.prediction_market_locked (只增加 net_amount)
         let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
-        pm_user_account.prediction_market_lock(net_amount as i64, solana_program::clock::Clock::get()?.unix_timestamp);
+        pm_user_account.prediction_market_lock(net_amount as i64, solana_program::clock::Clock::get()?.unix_timestamp)
+            .map_err(|_| VaultError::Overflow)?;
         pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
 
         // 8. 如果有 fee，执行 Token Transfer (Vault → PM Fee Vault)
@@ -2267,11 +2318,12 @@ impl Processor {
         account_info: &AccountInfo,
         program_id: &Pubkey,
         wallet: &Pubkey,
+        account_index: u8,
         token_index: u16,
     ) -> Result<u8, ProgramError> {
-        let (expected_pda, bump) = derive_spot_token_balance_pda(program_id, wallet, token_index);
+        let (expected_pda, bump) = derive_spot_token_balance_pda_with_index(program_id, wallet, account_index, token_index);
         if account_info.key != &expected_pda {
-            msg!("❌ Invalid SpotTokenBalance PDA: expected={}, got={}", expected_pda, account_info.key);
+            msg!("❌ Invalid SpotTokenBalance PDA: expected={}, got={}, account_index={}", expected_pda, account_info.key, account_index);
             return Err(VaultError::InvalidPda.into());
         }
         Ok(bump)
@@ -2286,6 +2338,7 @@ impl Processor {
         system_program: &AccountInfo<'a>,
         program_id: &Pubkey,
         wallet: &Pubkey,
+        account_index: u8,
         token_index: u16,
         bump: u8,
     ) -> Result<SpotTokenBalance, ProgramError> {
@@ -2301,6 +2354,7 @@ impl Processor {
         let seeds: &[&[u8]] = &[
             SPOT_BALANCE_SEED,
             wallet.as_ref(),
+            &[account_index],
             &token_index.to_le_bytes(),
             &[bump],
         ];
@@ -2365,11 +2419,15 @@ impl Processor {
         accounts: &[AccountInfo],
         token_index: u16,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
-        // One Account Experience: USDC 必须通过 Vault.Deposit，不能通过 SpotDeposit
         if token_index == 0 {
             msg!("❌ USDC (token_index=0) must use Vault.Deposit, not SpotDeposit. Use Vault instruction #2.");
             return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
         }
         
         let account_info_iter = &mut accounts.iter();
@@ -2377,16 +2435,58 @@ impl Processor {
         let balance_pda_info = next_account_info(account_info_iter)?;
         let user_token_account = next_account_info(account_info_iter)?;
         let vault_token_account = next_account_info(account_info_iter)?;
-        let _vault_config_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
         let token_program = next_account_info(account_info_iter)?;
         let system_program = next_account_info(account_info_iter)?;
 
         assert_signer(user)?;
 
-        let bump = Self::verify_spot_balance_pda(balance_pda_info, program_id, user.key, token_index)?;
+        // S-1: Verify VaultConfig PDA
+        let (expected_vault_config_pda, _) = Pubkey::find_program_address(&[b"vault_config"], program_id);
+        if vault_config_info.key != &expected_vault_config_pda {
+            msg!("❌ Invalid VaultConfig PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        // S-2: Verify vault_token_account is owned by vault_config PDA (prevents
+        // attackers from passing their own token account as the deposit destination).
+        // SPL Token Account layout: [mint(32), owner(32), ...]. The owner at bytes
+        // 32..64 must be the VaultConfig PDA so that only the vault program can
+        // authorize withdrawals from it.
+        let vault_ta_data = vault_token_account.try_borrow_data()?;
+        if vault_ta_data.len() < 64 {
+            msg!("❌ vault_token_account is not a valid SPL token account");
+            return Err(VaultError::InvalidAccount.into());
+        }
+        let vault_ta_mint = Pubkey::try_from(&vault_ta_data[0..32])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        let vault_ta_owner = Pubkey::try_from(&vault_ta_data[32..64])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        if vault_ta_owner != expected_vault_config_pda {
+            msg!("❌ vault_token_account owner ({}) != VaultConfig PDA ({})", vault_ta_owner, expected_vault_config_pda);
+            return Err(VaultError::InvalidAccount.into());
+        }
+        drop(vault_ta_data);
+
+        // S-4: Cross-check mints — user's token account and vault's token account
+        // must hold the same token type.
+        let user_ta_data = user_token_account.try_borrow_data()?;
+        if user_ta_data.len() < 32 {
+            msg!("❌ user_token_account is not a valid SPL token account");
+            return Err(VaultError::InvalidAccount.into());
+        }
+        let user_ta_mint = Pubkey::try_from(&user_ta_data[0..32])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        drop(user_ta_data);
+        if user_ta_mint != vault_ta_mint {
+            msg!("❌ Mint mismatch: user={}, vault={}", user_ta_mint, vault_ta_mint);
+            return Err(VaultError::InvalidAccount.into());
+        }
+
+        let bump = Self::verify_spot_balance_pda(balance_pda_info, program_id, user.key, account_index, token_index)?;
 
         let mut balance = Self::auto_init_spot_balance(
-            user, balance_pda_info, system_program, program_id, user.key, token_index, bump,
+            user, balance_pda_info, system_program, program_id, user.key, account_index, token_index, bump,
         )?;
 
         token_compat::transfer(
@@ -2408,11 +2508,15 @@ impl Processor {
         accounts: &[AccountInfo],
         token_index: u16,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
-        // One Account Experience: USDC 必须通过 Vault.Withdraw，不能通过 SpotWithdraw
         if token_index == 0 {
             msg!("❌ USDC (token_index=0) must use Vault.Withdraw, not SpotWithdraw. Use Vault instruction #3.");
             return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+
+        if amount == 0 {
+            return Err(VaultError::InvalidAmount.into());
         }
         
         let account_info_iter = &mut accounts.iter();
@@ -2425,7 +2529,7 @@ impl Processor {
 
         assert_signer(user)?;
 
-        Self::verify_spot_balance_pda(balance_pda_info, program_id, user.key, token_index)?;
+        Self::verify_spot_balance_pda(balance_pda_info, program_id, user.key, account_index, token_index)?;
 
         let mut balance = deserialize_account::<SpotTokenBalance>(&balance_pda_info.data.borrow())?;
         if balance.available_e6 < amount as i64 {
@@ -2433,12 +2537,41 @@ impl Processor {
             return Err(VaultError::InsufficientBalance.into());
         }
 
-        balance.available_e6 -= amount as i64;
+        balance.available_e6 = checked_sub(balance.available_e6, amount as i64)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
 
         let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(&[b"vault_config"], program_id);
         if vault_config_info.key != &vault_config_pda {
             return Err(VaultError::InvalidPda.into());
+        }
+
+        // S-3: Verify vault_token_account is owned by vault_config PDA
+        let vault_ta_data = vault_token_account.try_borrow_data()?;
+        if vault_ta_data.len() < 64 {
+            msg!("❌ vault_token_account is not a valid SPL token account");
+            return Err(VaultError::InvalidAccount.into());
+        }
+        let vault_ta_mint = Pubkey::try_from(&vault_ta_data[0..32])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        let vault_ta_owner = Pubkey::try_from(&vault_ta_data[32..64])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        if vault_ta_owner != vault_config_pda {
+            msg!("❌ vault_token_account owner mismatch");
+            return Err(VaultError::InvalidAccount.into());
+        }
+        drop(vault_ta_data);
+
+        // S-5: Cross-check mints for withdrawal
+        let user_ta_data = user_token_account.try_borrow_data()?;
+        if user_ta_data.len() < 32 {
+            return Err(VaultError::InvalidAccount.into());
+        }
+        let user_ta_mint = Pubkey::try_from(&user_ta_data[0..32])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        drop(user_ta_data);
+        if user_ta_mint != vault_ta_mint {
+            msg!("❌ Mint mismatch: user={}, vault={}", user_ta_mint, vault_ta_mint);
+            return Err(VaultError::InvalidAccount.into());
         }
 
         token_compat::transfer(
@@ -2475,8 +2608,8 @@ impl Processor {
         if balance.available_e6 < amount as i64 {
             return Err(VaultError::InsufficientBalance.into());
         }
-        balance.available_e6 -= amount as i64;
-        balance.locked_e6 = balance.locked_e6.checked_add(amount as i64).ok_or(VaultError::Overflow)?;
+        balance.available_e6 = checked_sub(balance.available_e6, amount as i64)?;
+        balance.locked_e6 = checked_add(balance.locked_e6, amount as i64)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
 
@@ -2508,8 +2641,8 @@ impl Processor {
         if balance.locked_e6 < amount as i64 {
             return Err(VaultError::InsufficientBalance.into());
         }
-        balance.locked_e6 -= amount as i64;
-        balance.available_e6 = balance.available_e6.checked_add(amount as i64).ok_or(VaultError::Overflow)?;
+        balance.locked_e6 = checked_sub(balance.locked_e6, amount as i64)?;
+        balance.available_e6 = checked_add(balance.available_e6, amount as i64)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
 
@@ -2539,6 +2672,7 @@ impl Processor {
         user_wallet: Pubkey,
         token_index: u16,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
         // One Account Experience: USDC 必须通过 RelayerDeposit，不能通过 RelayerSpotDeposit
         if token_index == 0 {
@@ -2558,9 +2692,9 @@ impl Processor {
             return Err(VaultError::UnauthorizedAdmin.into());
         }
 
-        let bump = Self::verify_spot_balance_pda(balance_pda_info, program_id, &user_wallet, token_index)?;
+        let bump = Self::verify_spot_balance_pda(balance_pda_info, program_id, &user_wallet, account_index, token_index)?;
         let mut balance = Self::auto_init_spot_balance(
-            admin, balance_pda_info, system_program, program_id, &user_wallet, token_index, bump,
+            admin, balance_pda_info, system_program, program_id, &user_wallet, account_index, token_index, bump,
         )?;
 
         balance.available_e6 = balance.available_e6.checked_add(amount as i64).ok_or(VaultError::Overflow)?;
@@ -2579,6 +2713,7 @@ impl Processor {
         user_wallet: Pubkey,
         token_index: u16,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
         // One Account Experience: USDC 必须通过 RelayerWithdraw，不能通过 RelayerSpotWithdraw
         if token_index == 0 {
@@ -2597,12 +2732,12 @@ impl Processor {
             return Err(VaultError::UnauthorizedAdmin.into());
         }
 
-        Self::verify_spot_balance_pda(balance_pda_info, program_id, &user_wallet, token_index)?;
+        Self::verify_spot_balance_pda(balance_pda_info, program_id, &user_wallet, account_index, token_index)?;
         let mut balance = deserialize_account::<SpotTokenBalance>(&balance_pda_info.data.borrow())?;
         if balance.available_e6 < amount as i64 {
             return Err(VaultError::InsufficientBalance.into());
         }
-        balance.available_e6 -= amount as i64;
+        balance.available_e6 = checked_sub(balance.available_e6, amount as i64)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
 
@@ -2629,6 +2764,8 @@ impl Processor {
         taker_fee_e6: i64,
         taker_is_buy: bool,
         _sequence: u64,
+        maker_account_index: u8,
+        taker_account_index: u8,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
@@ -2655,10 +2792,10 @@ impl Processor {
             return Err(VaultError::QuoteAssetMustUseVaultPath.into());
         }
 
-        let maker_base_bump = Self::verify_spot_balance_pda(maker_base_info, program_id, &maker_wallet, base_token_index)?;
-        let _maker_quote_bump = Self::verify_spot_balance_pda(maker_quote_info, program_id, &maker_wallet, quote_token_index)?;
-        let taker_base_bump = Self::verify_spot_balance_pda(taker_base_info, program_id, &taker_wallet, base_token_index)?;
-        let _taker_quote_bump = Self::verify_spot_balance_pda(taker_quote_info, program_id, &taker_wallet, quote_token_index)?;
+        let maker_base_bump = Self::verify_spot_balance_pda(maker_base_info, program_id, &maker_wallet, maker_account_index, base_token_index)?;
+        let _maker_quote_bump = Self::verify_spot_balance_pda(maker_quote_info, program_id, &maker_wallet, maker_account_index, quote_token_index)?;
+        let taker_base_bump = Self::verify_spot_balance_pda(taker_base_info, program_id, &taker_wallet, taker_account_index, base_token_index)?;
+        let _taker_quote_bump = Self::verify_spot_balance_pda(taker_quote_info, program_id, &taker_wallet, taker_account_index, quote_token_index)?;
 
         let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         let is_self_trade = maker_wallet == taker_wallet;
@@ -2684,14 +2821,14 @@ impl Processor {
             if taker_is_buy && taker_base_info.data_is_empty() {
                 Self::auto_init_spot_balance(
                     admin, taker_base_info, system_program, program_id,
-                    &taker_wallet, base_token_index, taker_base_bump,
+                    &taker_wallet, taker_account_index, base_token_index, taker_base_bump,
                 )?;
             }
             // Auto-init maker_base if seller hasn't had this token
             if !taker_is_buy && maker_base_info.data_is_empty() {
                 Self::auto_init_spot_balance(
                     admin, maker_base_info, system_program, program_id,
-                    &maker_wallet, base_token_index, maker_base_bump,
+                    &maker_wallet, maker_account_index, base_token_index, maker_base_bump,
                 )?;
             }
 
@@ -2779,6 +2916,7 @@ impl Processor {
         _accounts: &[AccountInfo],
         _user_wallet: Pubkey,
         _amount: u64,
+        _account_index: u8,
     ) -> ProgramResult {
         msg!("❌ SpotAllocateFromVault is deprecated. Use SpotLockUsdc instead (One Account Experience).");
         Err(VaultError::DeprecatedInstruction.into())
@@ -2794,6 +2932,7 @@ impl Processor {
         _accounts: &[AccountInfo],
         _user_wallet: Pubkey,
         _amount: u64,
+        _account_index: u8,
     ) -> ProgramResult {
         msg!("❌ SpotReleaseToVault is deprecated. USDC now stays in UserAccount (One Account Experience).");
         Err(VaultError::DeprecatedInstruction.into())
@@ -2821,6 +2960,8 @@ impl Processor {
         fee: u64,
         transfer_type: u8,
         reference_hash: [u8; 32],
+        from_account_index: u8,
+        to_account_index: u8,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
@@ -2844,20 +2985,14 @@ impl Processor {
         }
 
         // 验证 from UserAccount PDA
-        let (expected_from_pda, from_bump) = Pubkey::find_program_address(
-            &[b"user", from_wallet.as_ref()],
-            program_id,
-        );
+        let (expected_from_pda, _from_bump) = UserAccount::derive_pda(program_id, &from_wallet, from_account_index);
         if from_account_info.key != &expected_from_pda {
             msg!("Invalid from_account PDA");
             return Err(VaultError::InvalidUserAccount.into());
         }
 
         // 验证 to UserAccount PDA
-        let (expected_to_pda, _to_bump) = Pubkey::find_program_address(
-            &[b"user", to_wallet.as_ref()],
-            program_id,
-        );
+        let (expected_to_pda, _to_bump) = UserAccount::derive_pda(program_id, &to_wallet, to_account_index);
         if to_account_info.key != &expected_to_pda {
             msg!("Invalid to_account PDA");
             return Err(VaultError::InvalidUserAccount.into());
@@ -2873,7 +3008,7 @@ impl Processor {
             return Err(VaultError::InsufficientBalance.into());
         }
 
-        from_account.available_balance_e6 -= total_deduction;
+        from_account.available_balance_e6 = checked_sub(from_account.available_balance_e6, total_deduction)?;
         from_account.last_update_ts = get_current_timestamp();
 
         // 序列化 from UserAccount
@@ -2881,7 +3016,7 @@ impl Processor {
 
         // 加载并更新 to UserAccount
         let mut to_account: UserAccount = deserialize_account(&to_account_info.data.borrow())?;
-        to_account.available_balance_e6 += amount as i64;
+        to_account.available_balance_e6 = checked_add(to_account.available_balance_e6, amount as i64)?;
         to_account.last_update_ts = get_current_timestamp();
 
         // 序列化 to UserAccount
@@ -2921,11 +3056,8 @@ impl Processor {
             return Err(VaultError::UnauthorizedAdmin.into());
         }
 
-        // 验证 payer UserAccount PDA
-        let (expected_payer_pda, _) = Pubkey::find_program_address(
-            &[b"user", payer.as_ref()],
-            program_id,
-        );
+        // 验证 payer UserAccount PDA (recurring payments always use main account)
+        let (expected_payer_pda, _) = UserAccount::derive_pda(program_id, &payer, 0u8);
         if payer_account_info.key != &expected_payer_pda {
             return Err(VaultError::InvalidUserAccount.into());
         }
@@ -2945,7 +3077,7 @@ impl Processor {
             msg!("Insufficient balance for registration fee");
             return Err(VaultError::InsufficientBalance.into());
         }
-        payer_account.available_balance_e6 -= registration_fee as i64;
+        payer_account.available_balance_e6 = checked_sub(payer_account.available_balance_e6, registration_fee as i64)?;
         payer_account.last_update_ts = get_current_timestamp();
         payer_account.serialize(&mut &mut payer_account_info.data.borrow_mut()[..])?;
 
@@ -3017,19 +3149,13 @@ impl Processor {
             return Err(VaultError::UnauthorizedAdmin.into());
         }
 
-        // 验证 PDAs
-        let (expected_payer_pda, _) = Pubkey::find_program_address(
-            &[b"user", payer.as_ref()],
-            program_id,
-        );
+        // 验证 PDAs (recurring payments always use main account)
+        let (expected_payer_pda, _) = UserAccount::derive_pda(program_id, &payer, 0u8);
         if payer_account_info.key != &expected_payer_pda {
             return Err(VaultError::InvalidUserAccount.into());
         }
 
-        let (expected_payee_pda, _) = Pubkey::find_program_address(
-            &[b"user", payee.as_ref()],
-            program_id,
-        );
+        let (expected_payee_pda, _) = UserAccount::derive_pda(program_id, &payee, 0u8);
         if payee_account_info.key != &expected_payee_pda {
             return Err(VaultError::InvalidUserAccount.into());
         }
@@ -3063,13 +3189,13 @@ impl Processor {
         if payer_account.available_balance_e6 < total_deduction {
             return Err(VaultError::InsufficientBalance.into());
         }
-        payer_account.available_balance_e6 -= total_deduction;
+        payer_account.available_balance_e6 = checked_sub(payer_account.available_balance_e6, total_deduction)?;
         payer_account.last_update_ts = get_current_timestamp();
         payer_account.serialize(&mut &mut payer_account_info.data.borrow_mut()[..])?;
 
         // 增加 payee 余额
         let mut payee_account: UserAccount = deserialize_account(&payee_account_info.data.borrow())?;
-        payee_account.available_balance_e6 += amount as i64;
+        payee_account.available_balance_e6 = checked_add(payee_account.available_balance_e6, amount as i64)?;
         payee_account.last_update_ts = get_current_timestamp();
         payee_account.serialize(&mut &mut payee_account_info.data.borrow_mut()[..])?;
 
@@ -3137,6 +3263,7 @@ impl Processor {
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
         amount: u64,
+        account_index: u8,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let caller_info = next_account_info(account_info_iter)?;
@@ -3159,10 +3286,7 @@ impl Processor {
 
         // 3. M2 安全加固：验证 UserAccount PDA 对应 user_wallet
         assert_writable(user_account_info)?;
-        let (expected_user_pda, _) = Pubkey::find_program_address(
-            &[b"user", user_wallet.as_ref()],
-            _program_id,
-        );
+        let (expected_user_pda, _) = UserAccount::derive_pda(_program_id, &user_wallet, account_index);
         if user_account_info.key != &expected_user_pda {
             msg!("❌ CreditUserBalance: UserAccount PDA mismatch. Expected {} for wallet {}", expected_user_pda, user_wallet);
             return Err(VaultError::InvalidPda.into());
@@ -3292,6 +3416,8 @@ impl Processor {
         base_amount: u64,
         sequence: u64,
         base_token_index: u16,
+        buyer_account_index: u8,
+        _seller_account_index: u8,
     ) -> ProgramResult {
         if buyer_usdc > i64::MAX as u64 || seller_credit > i64::MAX as u64
             || buyer_fee > i64::MAX as u64 || seller_fee > i64::MAX as u64
@@ -3387,11 +3513,11 @@ impl Processor {
             let buyer_wallet = buyer.wallet;
             if buyer_base_info.data_is_empty() {
                 let buyer_base_bump = Self::verify_spot_balance_pda(
-                    buyer_base_info, program_id, &buyer_wallet, base_token_index
+                    buyer_base_info, program_id, &buyer_wallet, buyer_account_index, base_token_index
                 )?;
                 Self::auto_init_spot_balance(
                     caller, buyer_base_info, system_program, program_id,
-                    &buyer_wallet, base_token_index, buyer_base_bump,
+                    &buyer_wallet, buyer_account_index, base_token_index, buyer_base_bump,
                 )?;
             }
             let mut buyer_base = deserialize_account::<SpotTokenBalance>(&buyer_base_info.data.borrow())?;
@@ -3472,7 +3598,7 @@ impl Processor {
                      pm_user_account.prediction_market_locked_e6, locked_amount);
                 return Err(VaultError::InsufficientMargin.into());
             }
-            pm_user_account.prediction_market_locked_e6 -= locked_amount as i64;
+            pm_user_account.prediction_market_locked_e6 = checked_sub(pm_user_account.prediction_market_locked_e6, locked_amount as i64)?;
         }
         pm_user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
@@ -3493,6 +3619,222 @@ impl Processor {
         msg!("PM SettleToAvailableWithFee: locked={}, settlement={}, fee_bps={}, fee={}, net={}",
              locked_amount, settlement_amount, settlement_fee_bps, fee_amount, net_settlement);
         msg!("PM settlement fee {} recorded (pure accounting, no transfer)", fee_amount);
+        Ok(())
+    }
+
+    /// Process LockBond — CPI only, called by Exchange Program for PM Oracle proposals
+    fn process_lock_bond(accounts: &[AccountInfo], amount_e6: u64) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        assert_writable(user_account_info)?;
+
+        if amount_e6 == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+
+        if user_account.available_balance_e6 < amount_e6 as i64 {
+            return Err(VaultError::InsufficientBalance.into());
+        }
+
+        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount_e6 as i64)?;
+        user_account.oracle_locked_e6 = checked_add(user_account.oracle_locked_e6, amount_e6 as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("LockBond: {} e6 for {}", amount_e6, user_account.wallet);
+        Ok(())
+    }
+
+    /// Process ReleaseBond — CPI only, called by Exchange Program when Oracle dispute resolved
+    fn process_release_bond(accounts: &[AccountInfo], amount_e6: u64) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let caller_program = next_account_info(account_info_iter)?;
+
+        assert_writable(user_account_info)?;
+
+        if amount_e6 == 0 {
+            return Err(VaultError::InvalidAmount.into());
+        }
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        verify_cpi_caller(&vault_config, caller_program)?;
+
+        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+
+        if user_account.oracle_locked_e6 < amount_e6 as i64 {
+            return Err(VaultError::InsufficientOracleBond.into());
+        }
+
+        user_account.oracle_locked_e6 = checked_sub(user_account.oracle_locked_e6, amount_e6 as i64)?;
+        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, amount_e6 as i64)?;
+        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+
+        msg!("ReleaseBond: {} e6 for {}", amount_e6, user_account.wallet);
+        Ok(())
+    }
+
+    /// Sync UserAccount PDA from DB state (set-to-value, not increment).
+    /// Relayer-only. Used by recording_queue worker to mirror DB → chain.
+    fn process_sync_user_account(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        account_index: u8,
+        available_balance_e6: i64,
+        locked_margin_e6: i64,
+        spot_locked_e6: i64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let user_account_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+        assert_writable(user_account_info)?;
+
+        let vault_config_data = vault_config_info.data.borrow();
+        if vault_config_data.len() < 40 {
+            return Err(VaultError::InvalidAccount.into());
+        }
+        let stored_admin = Pubkey::try_from(&vault_config_data[8..40])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        if stored_admin != *admin.key {
+            msg!("SyncUserAccount: invalid relayer {} (expected {})", admin.key, stored_admin);
+            return Err(VaultError::InvalidRelayer.into());
+        }
+
+        let (user_account_pda, bump) = UserAccount::derive_pda(program_id, &user_wallet, account_index);
+        if user_account_info.key != &user_account_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        if user_account_info.data_is_empty() {
+            let rent = Rent::get()?;
+            let space = USER_ACCOUNT_SIZE;
+            let lamports = rent.minimum_balance(space);
+
+            invoke_signed(
+                &system_instruction::create_account(
+                    admin.key,
+                    user_account_info.key,
+                    lamports,
+                    space as u64,
+                    program_id,
+                ),
+                &[admin.clone(), user_account_info.clone(), system_program.clone()],
+                &[&[b"user", user_wallet.as_ref(), &[account_index], &[bump]]],
+            )?;
+
+            let user_account = UserAccount {
+                discriminator: UserAccount::DISCRIMINATOR,
+                wallet: user_wallet,
+                bump,
+                available_balance_e6,
+                locked_margin_e6,
+                unrealized_pnl_e6: 0,
+                total_deposited_e6: 0,
+                total_withdrawn_e6: 0,
+                last_update_ts: solana_program::clock::Clock::get()?.unix_timestamp,
+                spot_locked_e6,
+                account_index,
+                oracle_locked_e6: 0,
+                reserved: [0; 47],
+            };
+            user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+        } else {
+            let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
+            if user_account.wallet != user_wallet {
+                return Err(VaultError::InvalidAccount.into());
+            }
+
+            let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+            if current_ts < user_account.last_update_ts {
+                msg!("SyncUserAccount: stale update rejected (current={} < stored={})",
+                    current_ts, user_account.last_update_ts);
+                return Ok(());
+            }
+
+            user_account.available_balance_e6 = available_balance_e6;
+            user_account.locked_margin_e6 = locked_margin_e6;
+            user_account.spot_locked_e6 = spot_locked_e6;
+            user_account.last_update_ts = current_ts;
+            user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
+        }
+
+        msg!("SyncUserAccount: wallet={} idx={} avail={} locked={} spot={}",
+            user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6);
+        Ok(())
+    }
+
+    /// Sync SpotTokenBalance PDA from DB state (set-to-value, not increment).
+    /// Relayer-only. Used by recording_queue worker to mirror DB → chain.
+    fn process_sync_spot_token_balance(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        user_wallet: Pubkey,
+        account_index: u8,
+        token_index: u16,
+        available_e6: i64,
+        locked_e6: i64,
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let balance_pda_info = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let system_program = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+        assert_writable(balance_pda_info)?;
+
+        let vault_config_data = vault_config_info.data.borrow();
+        if vault_config_data.len() < 40 {
+            return Err(VaultError::InvalidAccount.into());
+        }
+        let stored_admin = Pubkey::try_from(&vault_config_data[8..40])
+            .map_err(|_| VaultError::InvalidAccount)?;
+        if stored_admin != *admin.key {
+            msg!("SyncSpotTokenBalance: invalid relayer {} (expected {})", admin.key, stored_admin);
+            return Err(VaultError::InvalidRelayer.into());
+        }
+
+        let (balance_pda, bump) = derive_spot_token_balance_pda_with_index(
+            program_id, &user_wallet, account_index, token_index,
+        );
+        if balance_pda_info.key != &balance_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        let mut balance = Self::auto_init_spot_balance(
+            admin, balance_pda_info, system_program, program_id,
+            &user_wallet, account_index, token_index, bump,
+        )?;
+
+        let current_ts = solana_program::clock::Clock::get()?.unix_timestamp;
+        if current_ts < balance.last_update_ts {
+            msg!("SyncSpotTokenBalance: stale update rejected (current={} < stored={})",
+                current_ts, balance.last_update_ts);
+            return Ok(());
+        }
+
+        balance.available_e6 = available_e6;
+        balance.locked_e6 = locked_e6;
+        balance.last_update_ts = current_ts;
+        balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
+
+        msg!("SyncSpotTokenBalance: wallet={} idx={} token={} avail={} locked={}",
+            user_wallet, account_index, token_index, available_e6, locked_e6);
         Ok(())
     }
 }

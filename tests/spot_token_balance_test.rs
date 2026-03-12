@@ -23,8 +23,12 @@ use vault_program::{
 };
 
 fn derive_balance_pda(program_id: &Pubkey, wallet: &Pubkey, token_index: u16) -> (Pubkey, u8) {
+    derive_balance_pda_with_index(program_id, wallet, 0, token_index)
+}
+
+fn derive_balance_pda_with_index(program_id: &Pubkey, wallet: &Pubkey, account_index: u8, token_index: u16) -> (Pubkey, u8) {
     Pubkey::find_program_address(
-        &[b"spot_balance", wallet.as_ref(), &token_index.to_le_bytes()],
+        &[b"spot_balance", wallet.as_ref(), &[account_index], &token_index.to_le_bytes()],
         program_id,
     )
 }
@@ -116,6 +120,7 @@ fn build_relayer_spot_deposit_ix(
             user_wallet: *user_wallet,
             token_index,
             amount,
+            account_index: 0,
         }
         .try_to_vec()
         .unwrap(),
@@ -143,6 +148,7 @@ fn build_relayer_spot_withdraw_ix(
             user_wallet: *user_wallet,
             token_index,
             amount,
+            account_index: 0,
         }
         .try_to_vec()
         .unwrap(),
@@ -190,6 +196,8 @@ fn build_relayer_settle_ix(
             taker_fee_e6,
             taker_is_buy,
             sequence: 1,
+            maker_account_index: 0,
+            taker_account_index: 0,
         }
         .try_to_vec()
         .unwrap(),
@@ -250,7 +258,7 @@ async fn test_relayer_spot_withdraw() {
     initialize_vault_config(&mut banks_client, &payer, &program_id).await;
 
     let user = Pubkey::new_unique();
-    let token_index: u16 = 0; // USDC
+    let token_index: u16 = 1; // non-USDC (token_index=0 must use Vault path)
 
     // Deposit 1000
     let ix = build_relayer_spot_deposit_ix(&program_id, &payer.pubkey(), &user, token_index, 1000_000_000);
@@ -598,8 +606,8 @@ async fn test_allocate_and_release() {
     let bh = banks_client.get_latest_blockhash().await.unwrap();
     banks_client.process_transaction(Transaction::new_signed_with_payer(&[airdrop_ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
 
-    // Initialize UserAccount PDA
-    let (user_account_pda, _) = Pubkey::find_program_address(&[b"user", user.pubkey().as_ref()], &program_id);
+    // Initialize UserAccount PDA (seeds: ["user", wallet, &[account_index]])
+    let (user_account_pda, _) = UserAccount::derive_pda(&program_id, &user.pubkey(), 0);
     let init_user_ix = Instruction {
         program_id,
         accounts: vec![
@@ -607,7 +615,7 @@ async fn test_allocate_and_release() {
             AccountMeta::new(user_account_pda, false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
-        data: VaultInstruction::InitializeUser.try_to_vec().unwrap(),
+        data: VaultInstruction::InitializeUser { account_index: 0 }.try_to_vec().unwrap(),
     };
     let bh = banks_client.get_latest_blockhash().await.unwrap();
     banks_client.process_transaction(Transaction::new_signed_with_payer(&[init_user_ix], Some(&user.pubkey()), &[&user], bh)).await.unwrap();
@@ -621,7 +629,7 @@ async fn test_allocate_and_release() {
             AccountMeta::new_readonly(derive_vault_config_pda(&program_id).0, false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
-        data: VaultInstruction::RelayerDeposit { user_wallet: user.pubkey(), amount: 5000_000_000 }.try_to_vec().unwrap(),
+        data: VaultInstruction::RelayerDeposit { user_wallet: user.pubkey(), amount: 5000_000_000, account_index: 0 }.try_to_vec().unwrap(),
     };
     let bh = banks_client.get_latest_blockhash().await.unwrap();
     banks_client.process_transaction(Transaction::new_signed_with_payer(&[deposit_ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
@@ -642,7 +650,7 @@ async fn test_allocate_and_release() {
             AccountMeta::new_readonly(derive_vault_config_pda(&program_id).0, false),
             AccountMeta::new_readonly(system_program::id(), false),
         ],
-        data: VaultInstruction::SpotAllocateFromVault { user_wallet: user.pubkey(), amount: 2000_000_000 }.try_to_vec().unwrap(),
+        data: VaultInstruction::SpotAllocateFromVault { user_wallet: user.pubkey(), amount: 2000_000_000, account_index: 0 }.try_to_vec().unwrap(),
     };
     let bh = banks_client.get_latest_blockhash().await.unwrap();
     banks_client.process_transaction(Transaction::new_signed_with_payer(&[allocate_ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();
@@ -664,7 +672,7 @@ async fn test_allocate_and_release() {
             AccountMeta::new(user_account_pda, false),
             AccountMeta::new_readonly(derive_vault_config_pda(&program_id).0, false),
         ],
-        data: VaultInstruction::SpotReleaseToVault { user_wallet: user.pubkey(), amount: 800_000_000 }.try_to_vec().unwrap(),
+        data: VaultInstruction::SpotReleaseToVault { user_wallet: user.pubkey(), amount: 800_000_000, account_index: 0 }.try_to_vec().unwrap(),
     };
     let bh = banks_client.get_latest_blockhash().await.unwrap();
     banks_client.process_transaction(Transaction::new_signed_with_payer(&[release_ix], Some(&payer.pubkey()), &[&payer], bh)).await.unwrap();

@@ -50,14 +50,11 @@ async fn test_initialize_user() {
     
     banks_client.process_transaction(airdrop_tx).await.unwrap();
 
-    // 派生UserAccount PDA
-    let (user_account_pda, _bump) = Pubkey::find_program_address(
-        &[b"user", user.pubkey().as_ref()],
-        &program_id,
-    );
+    // 派生UserAccount PDA (seeds: ["user", wallet, &[account_index]])
+    let (user_account_pda, _bump) = UserAccount::derive_pda(&program_id, &user.pubkey(), 0);
 
     // 创建InitializeUser指令
-    let instruction_data = VaultInstruction::InitializeUser;
+    let instruction_data = VaultInstruction::InitializeUser { account_index: 0 };
 
     let instruction = Instruction {
         program_id,
@@ -108,7 +105,9 @@ async fn test_state_calculations() {
         total_withdrawn_e6: 0,
         last_update_ts: 0,
         spot_locked_e6: 100_000_000,        // 100 USDC (One Account Experience)
-        reserved: [0; 56],
+        account_index: 0,
+        oracle_locked_e6: 0,
+        reserved: [0; 47],
     };
 
     // equity = available + locked_margin + spot_locked + unrealized_pnl
