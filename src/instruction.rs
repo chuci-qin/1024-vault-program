@@ -962,6 +962,7 @@ pub enum VaultInstruction {
         available_balance_e6: i64,
         locked_margin_e6: i64,
         spot_locked_e6: i64,
+        oracle_locked_e6: i64,
     },
 
     /// Index 53: Sync SpotTokenBalance from DB to chain (Relayer-only)

@@ -4,17 +4,7 @@ use crate::error::VaultError;
 use solana_program::{
     account_info::AccountInfo,
     program_error::ProgramError,
-    pubkey::Pubkey,
 };
-
-/// 验证账户所有者
-pub fn assert_owned_by(account: &AccountInfo, owner: &Pubkey) -> Result<(), ProgramError> {
-    if account.owner != owner {
-        Err(VaultError::InvalidAccount.into())
-    } else {
-        Ok(())
-    }
-}
 
 /// 验证账户是否为signer
 pub fn assert_signer(account: &AccountInfo) -> Result<(), ProgramError> {
@@ -47,11 +37,6 @@ pub fn checked_sub(a: i64, b: i64) -> Result<i64, ProgramError> {
 /// 安全的 u64 加法
 pub fn checked_add_u64(a: u64, b: u64) -> Result<u64, ProgramError> {
     a.checked_add(b).ok_or(VaultError::Overflow.into())
-}
-
-/// 安全的 u64 减法
-pub fn checked_sub_u64(a: u64, b: u64) -> Result<u64, ProgramError> {
-    a.checked_sub(b).ok_or(VaultError::Overflow.into())
 }
 
 /// 获取当前时间戳

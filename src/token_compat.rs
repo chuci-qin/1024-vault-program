@@ -40,31 +40,77 @@ pub fn get_mint_size(_token_program_id: &Pubkey) -> usize {
     spl_token::state::Mint::LEN
 }
 
-/// Create an InitializeAccount3 instruction (works for both v1 and v2)
-/// InitializeAccount3 doesn't require rent sysvar
-pub fn create_initialize_account3_instruction(
+/// Create a TransferChecked instruction (works for both v1 and v2).
+/// Preferred over Transfer for Token-2022 compatibility — validates decimals
+/// and mint, preventing silent truncation or wrong-mint transfers.
+pub fn create_transfer_checked_instruction(
     token_program_id: &Pubkey,
-    account: &Pubkey,
+    source: &Pubkey,
     mint: &Pubkey,
-    owner: &Pubkey,
+    destination: &Pubkey,
+    authority: &Pubkey,
+    amount: u64,
+    decimals: u8,
 ) -> Result<solana_program::instruction::Instruction, solana_program::program_error::ProgramError> {
-    // InitializeAccount3 is instruction 18 in both v1 and v2
-    // Format: [instruction_type (1 byte)] + [owner pubkey (32 bytes)]
-    let mut data = Vec::with_capacity(33);
-    data.push(18u8); // InitializeAccount3 instruction
-    data.extend_from_slice(owner.as_ref());
-    
+    // TransferChecked is instruction 12 in both v1 and v2
+    // Format: [instruction_type (1 byte)] + [amount (8 bytes LE)] + [decimals (1 byte)]
+    let mut data = Vec::with_capacity(10);
+    data.push(12u8); // TransferChecked instruction
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.push(decimals);
+
     Ok(solana_program::instruction::Instruction {
         program_id: *token_program_id,
         accounts: vec![
-            solana_program::instruction::AccountMeta::new(*account, false),
+            solana_program::instruction::AccountMeta::new(*source, false),
             solana_program::instruction::AccountMeta::new_readonly(*mint, false),
+            solana_program::instruction::AccountMeta::new(*destination, false),
+            solana_program::instruction::AccountMeta::new_readonly(*authority, true),
         ],
         data,
     })
 }
 
+/// TransferChecked with dynamic program support.
+/// Preferred for Token-2022 tokens; requires the mint account to validate decimals.
+pub fn transfer_checked<'a>(
+    token_program: &AccountInfo<'a>,
+    source: &AccountInfo<'a>,
+    mint: &AccountInfo<'a>,
+    destination: &AccountInfo<'a>,
+    authority: &AccountInfo<'a>,
+    amount: u64,
+    decimals: u8,
+    signer_seeds: Option<&[&[u8]]>,
+) -> ProgramResult {
+    let ix = create_transfer_checked_instruction(
+        token_program.key,
+        source.key,
+        mint.key,
+        destination.key,
+        authority.key,
+        amount,
+        decimals,
+    )?;
+
+    let account_infos = vec![
+        source.clone(),
+        mint.clone(),
+        destination.clone(),
+        authority.clone(),
+    ];
+
+    if let Some(seeds) = signer_seeds {
+        invoke_signed(&ix, &account_infos, &[seeds])
+    } else {
+        invoke(&ix, &account_infos)
+    }
+}
+
 /// Create a Transfer instruction (works for both v1 and v2)
+/// CHAIN-3 NOTE: For Token-2022 compatibility, prefer `transfer_checked` which
+/// validates decimals and mint.  This `transfer` function is retained for
+/// backward compatibility with existing Token v1 call sites (Deposit/Withdraw).
 pub fn create_transfer_instruction(
     token_program_id: &Pubkey,
     source: &Pubkey,
@@ -89,82 +135,11 @@ pub fn create_transfer_instruction(
     })
 }
 
-/// Create a MintTo instruction (works for both v1 and v2)
-pub fn create_mint_to_instruction(
-    token_program_id: &Pubkey,
-    mint: &Pubkey,
-    destination: &Pubkey,
-    authority: &Pubkey,
-    amount: u64,
-) -> Result<solana_program::instruction::Instruction, solana_program::program_error::ProgramError> {
-    // MintTo is instruction 7 in both v1 and v2
-    // Format: [instruction_type (1 byte)] + [amount (8 bytes LE)]
-    let mut data = Vec::with_capacity(9);
-    data.push(7u8); // MintTo instruction
-    data.extend_from_slice(&amount.to_le_bytes());
-    
-    Ok(solana_program::instruction::Instruction {
-        program_id: *token_program_id,
-        accounts: vec![
-            solana_program::instruction::AccountMeta::new(*mint, false),
-            solana_program::instruction::AccountMeta::new(*destination, false),
-            solana_program::instruction::AccountMeta::new_readonly(*authority, true),
-        ],
-        data,
-    })
-}
-
-/// Create a Burn instruction (works for both v1 and v2)
-pub fn create_burn_instruction(
-    token_program_id: &Pubkey,
-    account: &Pubkey,
-    mint: &Pubkey,
-    authority: &Pubkey,
-    amount: u64,
-) -> Result<solana_program::instruction::Instruction, solana_program::program_error::ProgramError> {
-    // Burn is instruction 8 in both v1 and v2
-    // Format: [instruction_type (1 byte)] + [amount (8 bytes LE)]
-    let mut data = Vec::with_capacity(9);
-    data.push(8u8); // Burn instruction
-    data.extend_from_slice(&amount.to_le_bytes());
-    
-    Ok(solana_program::instruction::Instruction {
-        program_id: *token_program_id,
-        accounts: vec![
-            solana_program::instruction::AccountMeta::new(*account, false),
-            solana_program::instruction::AccountMeta::new(*mint, false),
-            solana_program::instruction::AccountMeta::new_readonly(*authority, true),
-        ],
-        data,
-    })
-}
-
-/// Initialize a token account with dynamic program support
-#[allow(dead_code)]
-pub fn initialize_account<'a>(
-    token_program: &AccountInfo<'a>,
-    account: &AccountInfo<'a>,
-    mint: &AccountInfo<'a>,
-    owner: &Pubkey,
-    signer_seeds: Option<&[&[u8]]>,
-) -> ProgramResult {
-    let ix = create_initialize_account3_instruction(
-        token_program.key,
-        account.key,
-        mint.key,
-        owner,
-    )?;
-
-    let account_infos = vec![account.clone(), mint.clone()];
-
-    if let Some(seeds) = signer_seeds {
-        invoke_signed(&ix, &account_infos, &[seeds])
-    } else {
-        invoke(&ix, &account_infos)
-    }
-}
-
-/// Transfer tokens with dynamic program support
+/// Transfer tokens with dynamic program support.
+/// CHAIN-3: For new Spot token integrations (especially Token-2022), use
+/// `transfer_checked` instead.  Current Deposit/Withdraw paths use USDC
+/// (Token v1) where Transfer is safe, but SpotDeposit/SpotWithdraw should
+/// migrate to `transfer_checked` when adding Token-2022 asset support.
 pub fn transfer<'a>(
     token_program: &AccountInfo<'a>,
     source: &AccountInfo<'a>,
@@ -184,68 +159,6 @@ pub fn transfer<'a>(
     let account_infos = vec![
         source.clone(),
         destination.clone(),
-        authority.clone(),
-    ];
-
-    if let Some(seeds) = signer_seeds {
-        invoke_signed(&ix, &account_infos, &[seeds])
-    } else {
-        invoke(&ix, &account_infos)
-    }
-}
-
-/// Mint tokens with dynamic program support
-#[allow(dead_code)]
-pub fn mint_to<'a>(
-    token_program: &AccountInfo<'a>,
-    mint: &AccountInfo<'a>,
-    destination: &AccountInfo<'a>,
-    authority: &AccountInfo<'a>,
-    amount: u64,
-    signer_seeds: Option<&[&[u8]]>,
-) -> ProgramResult {
-    let ix = create_mint_to_instruction(
-        token_program.key,
-        mint.key,
-        destination.key,
-        authority.key,
-        amount,
-    )?;
-
-    let account_infos = vec![
-        mint.clone(),
-        destination.clone(),
-        authority.clone(),
-    ];
-
-    if let Some(seeds) = signer_seeds {
-        invoke_signed(&ix, &account_infos, &[seeds])
-    } else {
-        invoke(&ix, &account_infos)
-    }
-}
-
-/// Burn tokens with dynamic program support
-#[allow(dead_code)]
-pub fn burn<'a>(
-    token_program: &AccountInfo<'a>,
-    account: &AccountInfo<'a>,
-    mint: &AccountInfo<'a>,
-    authority: &AccountInfo<'a>,
-    amount: u64,
-    signer_seeds: Option<&[&[u8]]>,
-) -> ProgramResult {
-    let ix = create_burn_instruction(
-        token_program.key,
-        account.key,
-        mint.key,
-        authority.key,
-        amount,
-    )?;
-
-    let account_infos = vec![
-        account.clone(),
-        mint.clone(),
         authority.clone(),
     ];
 

@@ -536,8 +536,8 @@ async fn test_settle_conservation() {
     let tb_bal = read_spot_balance(&mut banks_client, &tb).await.unwrap();
     let tq_bal = read_spot_balance(&mut banks_client, &tq).await.unwrap();
 
-    let total_base_after = mb_bal.total() + tb_bal.total();
-    let total_quote_after = mq_bal.total() + tq_bal.total();
+    let total_base_after = mb_bal.total().unwrap() + tb_bal.total().unwrap();
+    let total_quote_after = mq_bal.total().unwrap() + tq_bal.total().unwrap();
 
     // Base conservation: 100M = 90M (maker) + 10M (taker)
     assert_eq!(total_base_after, total_base_before);

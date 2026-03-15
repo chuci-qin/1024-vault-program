@@ -104,17 +104,10 @@ pub struct VaultConfig {
 impl VaultConfig {
     pub const DISCRIMINATOR: u64 = 0x5641554C545F434F; // "VAULT_CO"
     
-    /// 验证调用方是否授权
+    /// L4-3: Verify caller is authorized — only uses authorized_callers array.
+    /// Deprecated ledger_program and fund_program checks removed.
+    /// When these fields are set to Pubkey::default(), they cannot match any caller.
     pub fn is_authorized_caller(&self, caller: &Pubkey) -> bool {
-        // Check ledger_program
-        if caller == &self.ledger_program {
-            return true;
-        }
-        // Check fund_program (non-zero check)
-        if self.fund_program != Pubkey::default() && caller == &self.fund_program {
-            return true;
-        }
-        // Check authorized_callers array (skip zero pubkeys)
         for authorized in &self.authorized_callers {
             if authorized != &Pubkey::default() && caller == authorized {
                 return true;
@@ -276,14 +269,6 @@ pub struct PredictionMarketUserAccount {
 impl PredictionMarketUserAccount {
     pub const DISCRIMINATOR: u64 = PREDICTION_MARKET_USER_ACCOUNT_DISCRIMINATOR;
     
-    /// PDA seeds
-    pub fn seeds(wallet: &Pubkey) -> Vec<Vec<u8>> {
-        vec![
-            PREDICTION_MARKET_USER_SEED.to_vec(),
-            wallet.to_bytes().to_vec(),
-        ]
-    }
-    
     /// 创建新的预测市场用户账户
     pub fn new(wallet: Pubkey, bump: u8, created_at: i64) -> Self {
         Self {
@@ -438,25 +423,40 @@ impl SpotTokenBalance {
         }
     }
 
-    /// Total balance (available + locked)
-    pub fn total(&self) -> i64 {
-        self.available_e6 + self.locked_e6
+    /// Total balance (available + locked). Uses checked arithmetic; returns error on overflow.
+    pub fn total(&self) -> Result<i64, &'static str> {
+        self.available_e6
+            .checked_add(self.locked_e6)
+            .ok_or("Overflow in SpotTokenBalance total (available_e6 + locked_e6)")
     }
 
-    /// Deduct from balance, preferring available first, then locked
-    /// Returns Ok(()) or Err if insufficient total balance
+    /// Deduct from balance, preferring available first, then locked.
+    /// Uses checked arithmetic; returns error on overflow/underflow or insufficient balance.
     pub fn deduct_prefer_available(&mut self, amount: i64) -> Result<(), &'static str> {
         if amount <= 0 {
             return Err("Deduct amount must be positive");
         }
-        if self.available_e6 >= amount {
-            self.available_e6 -= amount;
-        } else if self.available_e6 + self.locked_e6 >= amount {
-            let from_locked = amount - self.available_e6;
-            self.available_e6 = 0;
-            self.locked_e6 -= from_locked;
-        } else {
+        let total = self
+            .available_e6
+            .checked_add(self.locked_e6)
+            .ok_or("Overflow in SpotTokenBalance total (available_e6 + locked_e6)")?;
+        if total < amount {
             return Err("Insufficient balance");
+        }
+        if self.available_e6 >= amount {
+            self.available_e6 = self
+                .available_e6
+                .checked_sub(amount)
+                .ok_or("Underflow in SpotTokenBalance available_e6")?;
+        } else {
+            let from_locked = amount
+                .checked_sub(self.available_e6)
+                .ok_or("Underflow in from_locked calculation (amount - available_e6)")?;
+            self.available_e6 = 0;
+            self.locked_e6 = self
+                .locked_e6
+                .checked_sub(from_locked)
+                .ok_or("Underflow in SpotTokenBalance locked_e6")?;
         }
         Ok(())
     }
@@ -627,10 +627,6 @@ impl RecurringAuth {
         self.is_active = false;
     }
     
-    /// 更新状态哈希
-    pub fn update_state_hash(&mut self, hash: [u8; 32]) {
-        self.state_hash = hash;
-    }
 }
 
 #[cfg(test)]
@@ -701,7 +697,6 @@ mod tests {
         let other = Pubkey::new_unique();
         let authorized = Pubkey::new_unique();
         
-        // Create authorized_callers array with the authorized key
         let mut authorized_callers = [Pubkey::default(); 10];
         authorized_callers[0] = authorized;
         
@@ -720,10 +715,13 @@ mod tests {
             reserved: [0u8; 32],
         };
         
-        assert!(config.is_authorized_caller(&ledger));
-        assert!(config.is_authorized_caller(&fund));
+        // is_authorized_caller only checks authorized_callers array,
+        // NOT ledger_program or fund_program fields (deprecated).
+        assert!(!config.is_authorized_caller(&ledger));
+        assert!(!config.is_authorized_caller(&fund));
         assert!(config.is_authorized_caller(&authorized));
         assert!(!config.is_authorized_caller(&other));
+        assert!(!config.is_authorized_caller(&Pubkey::default()));
     }
 
     // === Prediction Market User Account Tests ===
@@ -916,7 +914,7 @@ mod tests {
         let mut balance = SpotTokenBalance::new(Pubkey::new_unique(), 0, 255, 0);
         balance.available_e6 = 1000_000_000;
         balance.locked_e6 = 500_000_000;
-        assert_eq!(balance.total(), 1500_000_000);
+        assert_eq!(balance.total().unwrap(), 1500_000_000);
     }
 
     #[test]
@@ -968,14 +966,14 @@ mod tests {
         balance.locked_e6 += 400_000_000;
         assert_eq!(balance.available_e6, 600_000_000);
         assert_eq!(balance.locked_e6, 400_000_000);
-        assert_eq!(balance.total(), 1000_000_000); // conservation
+        assert_eq!(balance.total().unwrap(), 1000_000_000); // conservation
 
         // Unlock 200: available=800, locked=200
         balance.locked_e6 -= 200_000_000;
         balance.available_e6 += 200_000_000;
         assert_eq!(balance.available_e6, 800_000_000);
         assert_eq!(balance.locked_e6, 200_000_000);
-        assert_eq!(balance.total(), 1000_000_000); // conservation
+        assert_eq!(balance.total().unwrap(), 1000_000_000); // conservation
 
         // Lock more than available should be caught by processor (checked arithmetic)
         let excess = balance.available_e6 + 1;

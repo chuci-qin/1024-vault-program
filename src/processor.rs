@@ -1,12 +1,28 @@
 //! Vault Program Processor
 //!
-//! Vault Program 职责: 纯用户资金托管 (用户的钱)
-//! 
-//! 架构原则:
-//! - Vault Program = 用户资金托管 (入金/出金/保证金)
-//! - Fund Program = 资金池管理 (保险基金/手续费/返佣等)
+//! 职责: 用户资金托管 — DB-First + 实时链上审计架构中的链上 Vault 组件
 //!
-//! 详见: onchain-program/vault_vs_fund.md
+//! ## 功能域
+//!
+//! | # | 域 | Handler 范围 | 说明 |
+//! |---|------|-------------|------|
+//! | 1 | Core | `process_initialize` ~ `process_withdraw` | 初始化、入金、出金 |
+//! | 2 | Admin | `process_add_authorized_caller` ~ `process_admin_force_release_margin` | 权限管理、暂停、紧急释放 |
+//! | 3 | Prediction Market | `process_initialize_prediction_market_user` ~ `process_admin_prediction_market_force_unlock` | PM 锁定/解锁/结算/领取 |
+//! | 4 | Relayer | `process_relayer_deposit` ~ `process_relayer_withdraw_and_transfer` | 代理入金/出金 |
+//! | 5 | PM Fee [deprecated] | `process_prediction_market_lock_with_fee` ~ `process_prediction_market_settle_with_fee` | V2 手续费 PM 指令，全部返回错误 |
+//! | 6 | Spot | `process_spot_deposit` ~ `process_spot_release_to_vault` | 现货入金/出金/锁定/结算 |
+//! | 7 | Payment | `process_relayer_internal_transfer` ~ `process_credit_user_balance` | 站内转账、定期授权支付 |
+//! | 8 | Spot USDC | `process_spot_lock_usdc` ~ `process_spot_settle_usdc_trade` | One Account USDC 统一管理 |
+//! | 9 | Bond | `process_lock_bond` ~ `process_release_bond` | PM Oracle 保证金 |
+//! | 10 | Sync | `process_sync_user_account` ~ `process_sync_spot_token_balance` | DB -> 链上状态镜像 |
+//!
+//! ## 架构要点
+//!
+//! - 只有 Deposit / Withdraw / SpotDeposit / SpotWithdraw 涉及真实 SPL Token 转账
+//! - 其他所有操作都是 PDA 内的纯记账操作
+//! - Sync 系列由 Recording Queue Worker 异步调用，幂等地将 DB 状态镜像到链上
+//! - Deprecated 指令保留 Borsh 枚举索引但返回错误
 
 use crate::{
     error::VaultError,
@@ -31,21 +47,6 @@ use solana_program::{
 // ============================================================================
 // PM Fee Config 字段偏移量 (基于 Fund Program state.rs)
 // ============================================================================
-mod pm_fee_config_offsets {
-    pub const _DISCRIMINATOR: usize = 0;      // 8 bytes
-    pub const FEE_VAULT: usize = 8;           // 32 bytes (Pubkey)
-    pub const _BUMP: usize = 40;              // 1 byte
-    pub const MINTING_FEE_BPS: usize = 41;    // 2 bytes (u16)
-    pub const REDEMPTION_FEE_BPS: usize = 43; // 2 bytes (u16)
-    pub const _TRADING_FEE_TAKER_BPS: usize = 45; // 2 bytes (u16)
-    pub const _TRADING_FEE_MAKER_BPS: usize = 47; // 2 bytes (u16)
-    pub const _SETTLEMENT_FEE_BPS: usize = 49;    // 2 bytes (u16)
-    pub const _PROTOCOL_SHARE_BPS: usize = 51;    // 2 bytes (u16)
-    pub const _MAKER_REWARD_SHARE_BPS: usize = 53; // 2 bytes (u16)
-    pub const _CREATOR_SHARE_BPS: usize = 55;     // 2 bytes (u16)
-    pub const MIN_SIZE: usize = 150;
-}
-
 /// 辅助函数：反序列化账户数据
 fn deserialize_account<T: BorshDeserialize>(data: &[u8]) -> Result<T, std::io::Error> {
     let mut slice = data;
@@ -53,6 +54,8 @@ fn deserialize_account<T: BorshDeserialize>(data: &[u8]) -> Result<T, std::io::E
 }
 
 /// 验证 CPI 调用方是否授权
+/// L4-2: Simplified CPI caller verification — only checks authorized_callers array.
+/// Removed deprecated ledger_config PDA derivation and ledger_program/fund_program checks.
 fn verify_cpi_caller(
     vault_config: &VaultConfig,
     caller_program: &AccountInfo,
@@ -61,26 +64,6 @@ fn verify_cpi_caller(
         msg!("CPI caller {} not authorized", caller_program.key);
         return Err(VaultError::UnauthorizedCaller.into());
     }
-    
-    // 验证是已知的授权调用方
-    let (expected_ledger_config, _bump) = Pubkey::find_program_address(
-        &[b"ledger_config"],
-        &vault_config.ledger_program
-    );
-    
-    if caller_program.key == &expected_ledger_config {
-        msg!("✅ CPI caller verified as ledger_config PDA");
-    } else if caller_program.key == &vault_config.ledger_program {
-        msg!("✅ CPI caller is ledger_program");
-    } else if vault_config.authorized_callers.iter().any(|pk| pk == caller_program.key && *pk != Pubkey::default()) {
-        msg!("✅ CPI caller in authorized list");
-    } else if vault_config.fund_program != Pubkey::default() && caller_program.key == &vault_config.fund_program {
-        msg!("✅ CPI caller is fund_program");
-    } else {
-        msg!("❌ Unknown CPI caller: {}", caller_program.key);
-        return Err(VaultError::InvalidCallerPda.into());
-    }
-    
     Ok(())
 }
 
@@ -111,28 +94,6 @@ fn verify_admin_or_cpi_caller(
 pub struct Processor;
 
 impl Processor {
-    /// Verify PMFeeConfig PDA is derived from the Fund program stored in VaultConfig.
-    /// Prevents spoofed PMFeeConfig accounts that could set fee rates to 0.
-    fn verify_pm_fee_config_pda(
-        pm_fee_config_info: &AccountInfo,
-        vault_config: &VaultConfig,
-    ) -> ProgramResult {
-        if vault_config.fund_program == Pubkey::default() {
-            msg!("⚠️ Fund program not set in VaultConfig, skipping PMFeeConfig PDA check");
-            return Ok(());
-        }
-        let (expected_pda, _) = Pubkey::find_program_address(
-            &[b"prediction_market_fee_config"],
-            &vault_config.fund_program,
-        );
-        if pm_fee_config_info.key != &expected_pda {
-            msg!("❌ PMFeeConfig PDA mismatch: got {}, expected {} (derived from fund_program {})",
-                 pm_fee_config_info.key, expected_pda, vault_config.fund_program);
-            return Err(VaultError::InvalidPda.into());
-        }
-        Ok(())
-    }
-
     /// Process instruction
     pub fn process(
         program_id: &Pubkey,
@@ -142,6 +103,7 @@ impl Processor {
         let instruction = VaultInstruction::try_from_slice(instruction_data)?;
 
         match instruction {
+            // --- Core: 初始化、入金、出金 ---
             VaultInstruction::Initialize {
                 ledger_program,
                 delegation_program,
@@ -168,6 +130,7 @@ impl Processor {
                 msg!("Instruction: Withdraw");
                 Self::process_withdraw(program_id, accounts, amount)
             }
+            // --- Deprecated: 返回错误，保留 Borsh 索引 ---
             VaultInstruction::LockMargin { .. } => {
                 msg!("Instruction: LockMargin — DEPRECATED, rejecting");
                 Err(ProgramError::InvalidInstructionData)
@@ -184,6 +147,7 @@ impl Processor {
                 msg!("Instruction: LiquidatePosition — DEPRECATED, rejecting");
                 Err(ProgramError::InvalidInstructionData)
             }
+            // --- Admin: 权限管理 ---
             VaultInstruction::AddAuthorizedCaller { caller } => {
                 msg!("Instruction: AddAuthorizedCaller");
                 Self::process_add_authorized_caller(accounts, caller)
@@ -204,16 +168,16 @@ impl Processor {
                 msg!("Instruction: SetFundProgram");
                 Self::process_set_fund_program(accounts, fund_program)
             }
-            VaultInstruction::SetLedgerProgram { ledger_program } => {
-                msg!("Instruction: SetLedgerProgram");
-                Self::process_set_ledger_program(accounts, ledger_program)
+            VaultInstruction::SetLedgerProgram { .. } => {
+                msg!("Instruction: SetLedgerProgram — DEPRECATED, rejecting");
+                Err(ProgramError::InvalidInstructionData)
             }
             VaultInstruction::AdminForceReleaseMargin { amount } => {
                 msg!("Instruction: AdminForceReleaseMargin");
                 Self::process_admin_force_release_margin(accounts, amount)
             }
             
-            // Prediction Market 指令
+            // --- Prediction Market ---
             VaultInstruction::InitializePredictionMarketUser => {
                 msg!("Instruction: InitializePredictionMarketUser");
                 Self::process_initialize_prediction_market_user(program_id, accounts)
@@ -255,7 +219,7 @@ impl Processor {
                 Self::process_prediction_market_settle_with_fee(program_id, accounts, locked_amount, settlement_amount)
             }
             
-            // Relayer 指令
+            // --- Relayer: 代理入金/出金 ---
             VaultInstruction::RelayerDeposit { user_wallet, amount, account_index } => {
                 msg!("Instruction: RelayerDeposit");
                 Self::process_relayer_deposit(program_id, accounts, user_wallet, amount, account_index)
@@ -265,10 +229,10 @@ impl Processor {
                 Self::process_relayer_withdraw(program_id, accounts, user_wallet, amount, account_index)
             }
             
-            // Spot 交易指令
+            // --- Spot ---
             VaultInstruction::Deprecated_InitializeSpotUser => {
-                msg!("Instruction: Deprecated_InitializeSpotUser");
-                Self::process_initialize_spot_user(program_id, accounts)
+                msg!("Instruction: Deprecated_InitializeSpotUser — DEPRECATED");
+                Err(VaultError::DeprecatedInstruction.into())
             }
             VaultInstruction::SpotDeposit { token_index, amount, account_index } => {
                 msg!("Instruction: SpotDeposit");
@@ -286,9 +250,9 @@ impl Processor {
                 msg!("Instruction: SpotUnlockBalance");
                 Self::process_spot_unlock_balance(program_id, accounts, token_index, amount)
             }
-            VaultInstruction::Deprecated_SpotSettleTrade { _is_buy, _base_token_index, _quote_token_index, _base_amount, _quote_amount, _sequence } => {
-                msg!("Instruction: Deprecated_SpotSettleTrade");
-                Self::process_spot_settle_trade(accounts, _is_buy, _base_token_index, _quote_token_index, _base_amount, _quote_amount, _sequence)
+            VaultInstruction::Deprecated_SpotSettleTrade { .. } => {
+                msg!("Instruction: Deprecated_SpotSettleTrade — DEPRECATED");
+                Err(VaultError::DeprecatedInstruction.into())
             }
             VaultInstruction::RelayerSpotDeposit { user_wallet, token_index, amount, account_index } => {
                 msg!("Instruction: RelayerSpotDeposit");
@@ -322,10 +286,7 @@ impl Processor {
                 Self::process_spot_release_to_vault(program_id, accounts, user_wallet, amount, account_index)
             }
 
-            // =========================================================================
-            // 站内支付相关指令
-            // =========================================================================
-
+            // --- Payment: 站内转账、定期支付 ---
             VaultInstruction::RelayerInternalTransfer {
                 from_wallet,
                 to_wallet,
@@ -375,6 +336,7 @@ impl Processor {
                 msg!("Instruction: CreditUserBalance");
                 Self::process_credit_user_balance(program_id, accounts, user_wallet, amount, account_index)
             }
+            // (PM 补充指令，因 Borsh 索引顺序保留在此处)
             VaultInstruction::PredictionMarketSettleToAvailable { locked_amount, settlement_amount } => {
                 msg!("Instruction: PredictionMarketSettleToAvailable");
                 Self::process_prediction_market_settle_to_available(program_id, accounts, locked_amount, settlement_amount)
@@ -383,11 +345,12 @@ impl Processor {
                 msg!("Instruction: RelayerPredictionMarketClaimSettlement");
                 Self::process_relayer_prediction_market_claim_settlement(accounts)
             }
+            // (Relayer 补充指令，因 Borsh 索引顺序保留在此处)
             VaultInstruction::RelayerWithdrawAndTransfer { user_wallet, amount, account_index } => {
                 msg!("Instruction: RelayerWithdrawAndTransfer");
                 Self::process_relayer_withdraw_and_transfer(program_id, accounts, user_wallet, amount, account_index)
             }
-            // One Account Experience — Spot USDC 统一管理
+            // --- Spot USDC: One Account Experience ---
             VaultInstruction::SpotLockUsdc { amount } => {
                 msg!("Instruction: SpotLockUsdc");
                 Self::process_spot_lock_usdc(accounts, amount)
@@ -400,10 +363,12 @@ impl Processor {
                 msg!("Instruction: SpotSettleUsdcTrade");
                 Self::process_spot_settle_usdc_trade(program_id, accounts, buyer_usdc, seller_credit, buyer_fee, seller_fee, base_amount, sequence, base_token_index, buyer_account_index, seller_account_index)
             }
+            // (PM 补充指令)
             VaultInstruction::PredictionMarketSettleToAvailableWithFee { locked_amount, settlement_amount } => {
                 msg!("Instruction: PredictionMarketSettleToAvailableWithFee");
                 Self::process_prediction_market_settle_to_available_with_fee(program_id, accounts, locked_amount, settlement_amount)
             }
+            // --- Bond: PM Oracle 保证金 ---
             VaultInstruction::LockBond { amount_e6 } => {
                 msg!("Instruction: LockBond");
                 Self::process_lock_bond(accounts, amount_e6)
@@ -412,9 +377,10 @@ impl Processor {
                 msg!("Instruction: ReleaseBond");
                 Self::process_release_bond(accounts, amount_e6)
             }
-            VaultInstruction::SyncUserAccount { user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6 } => {
+            // --- Sync: DB -> 链上状态镜像 ---
+            VaultInstruction::SyncUserAccount { user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6, oracle_locked_e6 } => {
                 msg!("Instruction: SyncUserAccount");
-                Self::process_sync_user_account(program_id, accounts, user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6)
+                Self::process_sync_user_account(program_id, accounts, user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6, oracle_locked_e6)
             }
             VaultInstruction::SyncSpotTokenBalance { user_wallet, account_index, token_index, available_e6, locked_e6 } => {
                 msg!("Instruction: SyncSpotTokenBalance");
@@ -422,6 +388,10 @@ impl Processor {
             }
         }
     }
+
+    // =========================================================================
+    // Core: 初始化、入金、出金
+    // =========================================================================
 
     /// 处理初始化
     fn process_initialize(
@@ -453,6 +423,11 @@ impl Processor {
         let rent = Rent::get()?;
         let space = VAULT_CONFIG_SIZE;
         let lamports = rent.minimum_balance(space);
+
+        if !vault_config_info.data_is_empty() || vault_config_info.lamports() > 0 {
+            msg!("VaultConfig already initialized");
+            return Err(VaultError::AlreadyInitialized.into());
+        }
 
         invoke_signed(
             &system_instruction::create_account(
@@ -558,6 +533,12 @@ impl Processor {
         assert_writable(user_account_info)?;
         assert_writable(vault_config_info)?;
 
+        // V-1: Verify token_program is a known SPL Token program
+        if !token_compat::is_valid_token_program(token_program.key) {
+            msg!("❌ Invalid token program: expected SPL Token or Token-2022");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
         if amount == 0 {
             return Err(VaultError::InvalidAmount.into());
         }
@@ -627,6 +608,12 @@ impl Processor {
         assert_signer(user)?;
         assert_writable(user_account_info)?;
 
+        // V-1: Verify token_program is a known SPL Token program
+        if !token_compat::is_valid_token_program(token_program.key) {
+            msg!("❌ Invalid token program: expected SPL Token or Token-2022");
+            return Err(VaultError::InvalidAccount.into());
+        }
+
         if amount == 0 {
             return Err(VaultError::InvalidAmount.into());
         }
@@ -681,213 +668,9 @@ impl Processor {
         Ok(())
     }
 
-    /// 处理锁定保证金 (CPI only)
-    fn process_lock_margin(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-
-        assert_writable(user_account_info)?;
-
-        if amount == 0 {
-            return Err(VaultError::InvalidAmount.into());
-        }
-
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        
-        // S3-8.5 (DEC-4): Include unrealized_pnl_e6 in available balance check.
-        // Industry standard: cross margin uses floating PnL for buying power.
-        let effective_available = user_account.available_balance_e6 + user_account.unrealized_pnl_e6;
-        if effective_available < amount as i64 {
-            msg!("InsufficientBalance: available={}, upnl={}, effective={}, required={}",
-                user_account.available_balance_e6, user_account.unrealized_pnl_e6,
-                effective_available, amount);
-            return Err(VaultError::InsufficientBalance.into());
-        }
-
-        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
-        user_account.locked_margin_e6 = checked_add(user_account.locked_margin_e6, amount as i64)?;
-        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        msg!("Locked margin: {} e6 for {}", amount, user_account.wallet);
-        Ok(())
-    }
-
-    /// 处理释放保证金 (CPI only)
-    fn process_release_margin(accounts: &[AccountInfo], amount: u64) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-
-        assert_writable(user_account_info)?;
-
-        if amount == 0 {
-            return Err(VaultError::InvalidAmount.into());
-        }
-
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        
-        if user_account.locked_margin_e6 < amount as i64 {
-            return Err(VaultError::InsufficientMargin.into());
-        }
-
-        user_account.locked_margin_e6 = checked_sub(user_account.locked_margin_e6, amount as i64)?;
-        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, amount as i64)?;
-        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        msg!("Released margin: {} e6 for {}", amount, user_account.wallet);
-        Ok(())
-    }
-
-    /// 处理平仓结算 (CPI only)
-    /// 
-    /// 注意: 手续费的分配 (到保险基金/返佣等) 由 Ledger Program 
-    /// 单独通过 CPI 调用 Fund Program 处理
-    fn process_close_position_settle(
-        accounts: &[AccountInfo],
-        margin_to_release: u64,
-        realized_pnl: i64,
-        fee: u64,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-
-        assert_writable(user_account_info)?;
-
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        
-        // 1. 释放保证金
-        if user_account.locked_margin_e6 < margin_to_release as i64 {
-            return Err(VaultError::InsufficientMargin.into());
-        }
-        user_account.locked_margin_e6 = checked_sub(user_account.locked_margin_e6, margin_to_release as i64)?;
-        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, margin_to_release as i64)?;
-        
-        // 🔧 自动清理残留 locked_margin
-        // 当释放后 locked_margin 小于 1 USDC (1_000_000 e6) 时，自动释放全部剩余
-        // 这解决了精度累积误差导致的残留问题
-        if user_account.locked_margin_e6 > 0 && user_account.locked_margin_e6 < 1_000_000 {
-            msg!("🔧 Auto-cleanup: releasing residual locked_margin={}", user_account.locked_margin_e6);
-            user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, user_account.locked_margin_e6)?;
-            user_account.locked_margin_e6 = 0;
-        }
-
-        // 2. 结算盈亏
-        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, realized_pnl)?;
-
-        // 3. 扣除手续费 (手续费的分配由 Ledger 调用 Fund Program)
-        if user_account.available_balance_e6 < fee as i64 {
-            return Err(VaultError::InsufficientBalance.into());
-        }
-        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, fee as i64)?;
-
-        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        msg!(
-            "ClosePositionSettle: margin={}, pnl={}, fee={}",
-            margin_to_release,
-            realized_pnl,
-            fee
-        );
-        Ok(())
-    }
-
-    /// 处理清算 (CPI only)
-    /// 
-    /// 执行清算时的完整资金处理:
-    /// 1. 清空用户锁定保证金
-    /// 2. 返还剩余给用户
-    /// 3. 将清算罚金从 Vault Token Account 转入 Insurance Fund Vault
-    fn process_liquidate_position(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        _margin: u64,
-        user_remainder: u64,
-        liquidation_penalty: u64,
-    ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-        let vault_token_account = next_account_info(account_info_iter)?;
-        let insurance_fund_vault = next_account_info(account_info_iter)?;
-        let token_program = next_account_info(account_info_iter)?;
-
-        assert_writable(user_account_info)?;
-        assert_writable(vault_token_account)?;
-        assert_writable(insurance_fund_vault)?;
-
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        
-        // 1. 清空锁定保证金
-        user_account.locked_margin_e6 = 0;
-        
-        // 2. 返还剩余给用户 (如果有)
-        if user_remainder > 0 {
-            user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, user_remainder as i64)?;
-        }
-
-        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        // 3. 将清算罚金从 Vault Token Account 转入 Insurance Fund Vault
-        if liquidation_penalty > 0 {
-            // 验证 vault_token_account 是 VaultConfig 中配置的
-            if vault_config.vault_token_account != *vault_token_account.key {
-                msg!("❌ Invalid vault token account");
-                return Err(VaultError::InvalidAccount.into());
-            }
-            
-            // 使用 VaultConfig PDA 作为 authority 签名
-            let (vault_config_pda, bump) = Pubkey::find_program_address(
-                &[b"vault_config"],
-                program_id,
-            );
-            
-            if vault_config_pda != *vault_config_info.key {
-                msg!("❌ VaultConfig PDA mismatch");
-                return Err(VaultError::InvalidAccount.into());
-            }
-            
-            // G5 A2: 删除真实 USDC 转账（纯记账模式 — 清算罚金仅通过 InsuranceFundConfig 统计追踪）
-            // 原: token_compat::transfer(... vault → insurance_fund_vault ...)
-            msg!("Liquidation penalty {} recorded (pure accounting, no transfer)", liquidation_penalty);
-            let _ = insurance_fund_vault; // suppress unused
-            let _ = token_program;
-            let _ = bump;
-            
-            msg!(
-                "✅ Liquidation penalty {} recorded to Insurance Fund (accounting only)",
-                liquidation_penalty
-            );
-        }
-
-        msg!(
-            "Liquidated user account: remainder={}, penalty={}",
-            user_remainder,
-            liquidation_penalty
-        );
-        Ok(())
-    }
+    // =========================================================================
+    // Admin: 权限管理、暂停、紧急释放
+    // =========================================================================
 
     fn process_add_authorized_caller(accounts: &[AccountInfo], caller: Pubkey) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
@@ -1028,27 +811,6 @@ impl Processor {
         Ok(())
     }
     
-    fn process_set_ledger_program(accounts: &[AccountInfo], ledger_program: Pubkey) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let admin = next_account_info(account_info_iter)?;
-        let vault_config_info = next_account_info(account_info_iter)?;
-
-        assert_signer(admin)?;
-        assert_writable(vault_config_info)?;
-
-        let mut vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        
-        if vault_config.admin != *admin.key {
-            return Err(VaultError::InvalidAdmin.into());
-        }
-
-        vault_config.ledger_program = ledger_program;
-        vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
-
-        msg!("Ledger program set to: {}", ledger_program);
-        Ok(())
-    }
-
     /// Admin 强制释放用户锁定保证金
     /// 
     /// 用于处理用户没有任何持仓但 locked_margin 残留的异常情况
@@ -1622,6 +1384,17 @@ impl Processor {
             return Err(VaultError::InvalidAmount.into());
         }
 
+        // V-6: Per-relayer daily deposit rate limit.
+        // The on-chain program cannot query clock-based daily aggregates efficiently,
+        // so we enforce a per-TX ceiling here.  The backend (gateway) should enforce
+        // the aggregate daily limit before calling this instruction.
+        // Max single deposit: 10M USDC (prevents fat-finger or exploit in a single TX).
+        const MAX_SINGLE_DEPOSIT_E6: u64 = 10_000_000_000_000; // $10M
+        if amount > MAX_SINGLE_DEPOSIT_E6 {
+            msg!("❌ V-6: Deposit amount {} exceeds per-TX limit {}", amount, MAX_SINGLE_DEPOSIT_E6);
+            return Err(VaultError::InvalidAmount.into());
+        }
+
         // 3. 验证 UserAccount PDA
         let (user_account_pda, bump) = UserAccount::derive_pda(program_id, &user_wallet, account_index);
         if user_account_info.key != &user_account_pda {
@@ -1808,7 +1581,11 @@ impl Processor {
         let relayer_token_account = next_account_info(account_info_iter)?;
         let token_program = next_account_info(account_info_iter)?;
 
-        assert_signer(admin)?;
+        // 1. Verify vault_authority (admin/relayer) is signed
+        if !admin.is_signer {
+            msg!("RelayerWithdrawAndTransfer: vault_authority (admin) must sign");
+            return Err(ProgramError::InvalidAccountData);
+        }
         assert_writable(user_account_info)?;
         assert_writable(vault_token_account)?;
         assert_writable(relayer_token_account)?;
@@ -1833,10 +1610,11 @@ impl Processor {
             return Err(VaultError::InvalidAmount.into());
         }
 
+        // 2. Verify UserAccount PDA derivation is correct (seeds match)
         let (user_account_pda, _bump) = UserAccount::derive_pda(program_id, &user_wallet, account_index);
         if user_account_info.key != &user_account_pda {
-            msg!("❌ Invalid UserAccount PDA");
-            return Err(VaultError::InvalidPda.into());
+            msg!("RelayerWithdrawAndTransfer: UserAccount PDA derivation mismatch (expected {}, got {})", user_account_pda, user_account_info.key);
+            return Err(ProgramError::InvalidAccountData);
         }
 
         if user_account_info.data_is_empty() {
@@ -1851,9 +1629,16 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
+        // 3. Verify amount doesn't exceed user's available balance
         if user_account.available_balance_e6 < amount as i64 {
-            msg!("❌ Insufficient balance: {} < {}", user_account.available_balance_e6, amount);
+            msg!("RelayerWithdrawAndTransfer: amount {} exceeds available balance {}", amount, user_account.available_balance_e6);
             return Err(VaultError::InsufficientBalance.into());
+        }
+
+        // 4. Verify destination is not the vault itself (prevents self-referential transfer)
+        if relayer_token_account.key == vault_token_account.key {
+            msg!("RelayerWithdrawAndTransfer: destination cannot be the vault token account (self-referential transfer)");
+            return Err(ProgramError::InvalidAccountData);
         }
 
         user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, amount as i64)?;
@@ -1899,290 +1684,21 @@ impl Processor {
     /// 8. `[signer, writable]` Payer (optional, for auto-init)
     /// 9. `[]` System Program (optional, for auto-init)
     fn process_prediction_market_lock_with_fee(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        gross_amount: u64,
+        _program_id: &Pubkey,
+        _accounts: &[AccountInfo],
+        _gross_amount: u64,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        
-        // 解析必需账户
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let pm_user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-        let vault_token_account_info = next_account_info(account_info_iter)?;
-        let pm_fee_vault_info = next_account_info(account_info_iter)?;
-        let pm_fee_config_info = next_account_info(account_info_iter)?;
-        let _token_program_info = next_account_info(account_info_iter)?;
-        
-        // 可选账户 (用于 auto-init PMUserAccount)
-        let payer_info = next_account_info(account_info_iter).ok();
-        let system_program_info = next_account_info(account_info_iter).ok();
-
-        assert_writable(user_account_info)?;
-        assert_writable(pm_user_account_info)?;
-        assert_writable(vault_token_account_info)?;
-        assert_writable(pm_fee_vault_info)?;
-
-        if gross_amount == 0 {
-            return Err(VaultError::InvalidAmount.into());
-        }
-
-        // 1. 验证 VaultConfig 和 CPI 调用方
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        // 2. 验证 Vault Token Account
-        if vault_token_account_info.key != &vault_config.vault_token_account {
-            msg!("❌ Invalid vault_token_account");
-            return Err(VaultError::InvalidAccount.into());
-        }
-
-        // 2.5 验证 PMFeeConfig PDA 地址（防伪造）
-        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
-
-        // 3. 读取 PM Fee Config 获取费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
-        let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
-        if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
-            msg!("❌ PM Fee Config not initialized");
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        // 读取 minting fee bps (offset 41, 2 bytes)
-        let minting_fee_bps = u16::from_le_bytes([
-            pm_fee_config_data[pm_fee_config_offsets::MINTING_FEE_BPS],
-            pm_fee_config_data[pm_fee_config_offsets::MINTING_FEE_BPS + 1],
-        ]);
-        
-        // 读取 PM Fee Vault 地址 (offset 8, 32 bytes) 用于验证
-        let expected_fee_vault = Pubkey::new_from_array(
-            pm_fee_config_data[pm_fee_config_offsets::FEE_VAULT..pm_fee_config_offsets::FEE_VAULT + 32]
-                .try_into()
-                .unwrap()
-        );
-        
-        if pm_fee_vault_info.key != &expected_fee_vault {
-            msg!("❌ PM Fee Vault mismatch: expected {}, got {}", expected_fee_vault, pm_fee_vault_info.key);
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        drop(pm_fee_config_data);
-
-        // 4. 计算 fee 和 net_amount
-        let fee_amount = ((gross_amount as u128) * (minting_fee_bps as u128) / 10000) as u64;
-        let net_amount = gross_amount.saturating_sub(fee_amount);
-        
-        msg!("PM Lock with Fee: gross={}, fee_bps={}, fee={}, net={}", 
-             gross_amount, minting_fee_bps, fee_amount, net_amount);
-
-        // 5. 从 UserAccount 扣除 gross_amount
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        if user_account.available_balance_e6 < gross_amount as i64 {
-            msg!("❌ Insufficient balance: {} < {}", user_account.available_balance_e6, gross_amount);
-            return Err(VaultError::InsufficientBalance.into());
-        }
-        user_account.available_balance_e6 = checked_sub(user_account.available_balance_e6, gross_amount as i64)?;
-        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        // 6. Auto-init PMUserAccount if empty
-        if pm_user_account_info.data_is_empty() {
-            msg!("Auto-initializing PMUserAccount for {}", user_account.wallet);
-            
-            let payer = payer_info.ok_or_else(|| {
-                msg!("❌ PMUserAccount not initialized and no payer provided");
-                VaultError::InvalidAccount
-            })?;
-            let system_program = system_program_info.ok_or_else(|| {
-                msg!("❌ PMUserAccount not initialized and no system_program provided");
-                VaultError::InvalidAccount
-            })?;
-            
-            let (pm_user_pda, bump) = Pubkey::find_program_address(
-                &[PREDICTION_MARKET_USER_SEED, user_account.wallet.as_ref()],
-                program_id,
-            );
-            
-            if pm_user_account_info.key != &pm_user_pda {
-                msg!("❌ Invalid PMUserAccount PDA");
-                return Err(VaultError::InvalidPda.into());
-            }
-            
-            let rent = Rent::get()?;
-            let space = PREDICTION_MARKET_USER_ACCOUNT_SIZE;
-            let lamports = rent.minimum_balance(space);
-            
-            invoke_signed(
-                &system_instruction::create_account(
-                    payer.key,
-                    pm_user_account_info.key,
-                    lamports,
-                    space as u64,
-                    program_id,
-                ),
-                &[payer.clone(), pm_user_account_info.clone(), system_program.clone()],
-                &[&[PREDICTION_MARKET_USER_SEED, user_account.wallet.as_ref(), &[bump]]],
-            )?;
-            
-            let pm_user_account = PredictionMarketUserAccount::new(
-                user_account.wallet,
-                bump,
-                solana_program::clock::Clock::get()?.unix_timestamp,
-            );
-            pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
-            msg!("✅ PMUserAccount auto-initialized for {}", user_account.wallet);
-        }
-
-        // 7. 增加 PMUserAccount.prediction_market_locked (只增加 net_amount)
-        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
-        pm_user_account.prediction_market_lock(net_amount as i64, solana_program::clock::Clock::get()?.unix_timestamp)
-            .map_err(|_| VaultError::Overflow)?;
-        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
-
-        // 8. 如果有 fee，执行 Token Transfer (Vault → PM Fee Vault)
-        if fee_amount > 0 {
-            // Derive VaultConfig PDA for signing
-            let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(
-                &[b"vault_config"],
-                program_id,
-            );
-            
-            if vault_config_info.key != &vault_config_pda {
-                msg!("❌ Invalid VaultConfig PDA");
-                return Err(VaultError::InvalidPda.into());
-            }
-            
-            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
-            
-            // 纯记账模式：USDC 留在主金库，fee = gross - net
-            msg!("PM minting fee {} recorded (pure accounting, no transfer)", fee_amount);
-            let _ = pm_fee_vault_info;
-        }
-
-        msg!("✅ PredictionMarketLockWithFee completed: gross={}, fee={}, net={}", 
-             gross_amount, fee_amount, net_amount);
-        Ok(())
+        msg!("❌ PredictionMarketLockWithFee is deprecated (DB-First + PM Program deprecated). Rejecting.");
+        Err(VaultError::DeprecatedInstruction.into())
     }
 
-    /// 预测市场释放锁定并扣除手续费 (CPI only)
-    /// 
-    /// V2 Fee Architecture: 在 Vault 层面收取赎回手续费
-    /// 
-    /// Accounts:
-    /// 0. `[]` VaultConfig
-    /// 1. `[writable]` UserAccount
-    /// 2. `[writable]` PredictionMarketUserAccount
-    /// 3. `[]` Caller Program
-    /// 4. `[writable]` Vault Token Account
-    /// 5. `[writable]` PM Fee Vault
-    /// 6. `[]` PM Fee Config PDA (read-only: fee rates only)
-    /// 7. `[]` Token Program
     fn process_prediction_market_unlock_with_fee(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        gross_amount: u64,
+        _program_id: &Pubkey,
+        _accounts: &[AccountInfo],
+        _gross_amount: u64,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let pm_user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-        let vault_token_account_info = next_account_info(account_info_iter)?;
-        let pm_fee_vault_info = next_account_info(account_info_iter)?;
-        let pm_fee_config_info = next_account_info(account_info_iter)?;
-        let _token_program_info = next_account_info(account_info_iter)?;
-
-        assert_writable(user_account_info)?;
-        assert_writable(pm_user_account_info)?;
-        assert_writable(vault_token_account_info)?;
-        assert_writable(pm_fee_vault_info)?;
-
-        if gross_amount == 0 {
-            return Err(VaultError::InvalidAmount.into());
-        }
-
-        // 1. 验证 VaultConfig 和 CPI 调用方
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        // 2. 验证 Vault Token Account
-        if vault_token_account_info.key != &vault_config.vault_token_account {
-            msg!("❌ Invalid vault_token_account");
-            return Err(VaultError::InvalidAccount.into());
-        }
-
-        // 2.5 验证 PMFeeConfig PDA 地址（防伪造）
-        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
-
-        // 3. 读取 PM Fee Config 获取费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
-        let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
-        if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
-            msg!("❌ PM Fee Config not initialized");
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        // 读取 redemption fee bps (offset 43, 2 bytes)
-        let redemption_fee_bps = u16::from_le_bytes([
-            pm_fee_config_data[pm_fee_config_offsets::REDEMPTION_FEE_BPS],
-            pm_fee_config_data[pm_fee_config_offsets::REDEMPTION_FEE_BPS + 1],
-        ]);
-        
-        // 读取 PM Fee Vault 地址用于验证
-        let expected_fee_vault = Pubkey::new_from_array(
-            pm_fee_config_data[pm_fee_config_offsets::FEE_VAULT..pm_fee_config_offsets::FEE_VAULT + 32]
-                .try_into()
-                .unwrap()
-        );
-        
-        if pm_fee_vault_info.key != &expected_fee_vault {
-            msg!("❌ PM Fee Vault mismatch");
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        drop(pm_fee_config_data);
-
-        // 4. 计算 fee 和 net_amount
-        let fee_amount = ((gross_amount as u128) * (redemption_fee_bps as u128) / 10000) as u64;
-        let net_amount = gross_amount.saturating_sub(fee_amount);
-        
-        msg!("PM Unlock with Fee: gross={}, fee_bps={}, fee={}, net={}", 
-             gross_amount, redemption_fee_bps, fee_amount, net_amount);
-
-        // 5. 从 PMUserAccount 扣除 gross_amount
-        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
-        pm_user_account.prediction_market_unlock(gross_amount as i64, solana_program::clock::Clock::get()?.unix_timestamp)
-            .map_err(|_| VaultError::InsufficientMargin)?;
-        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
-
-        // 6. 增加 UserAccount.available_balance (只增加 net_amount)
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, net_amount as i64)?;
-        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        // 7. 如果有 fee，执行 Token Transfer (Vault → PM Fee Vault)
-        if fee_amount > 0 {
-            let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(
-                &[b"vault_config"],
-                program_id,
-            );
-            
-            if vault_config_info.key != &vault_config_pda {
-                msg!("❌ Invalid VaultConfig PDA");
-                return Err(VaultError::InvalidPda.into());
-            }
-            
-            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
-            
-            // 纯记账模式：USDC 留在主金库，fee = gross - net
-            msg!("PM redemption fee {} recorded (pure accounting, no transfer)", fee_amount);
-            let _ = pm_fee_vault_info;
-        }
-
-        msg!("✅ PredictionMarketUnlockWithFee completed: gross={}, fee={}, net={}", 
-             gross_amount, fee_amount, net_amount);
-        Ok(())
+        msg!("❌ PredictionMarketUnlockWithFee is deprecated (DB-First + PM Program deprecated). Rejecting.");
+        Err(VaultError::DeprecatedInstruction.into())
     }
 
     /// [DEPRECATED] PM trading fees are now collected off-chain by executor.rs.
@@ -2197,115 +1713,14 @@ impl Processor {
         Err(ProgramError::InvalidInstructionData)
     }
 
-    /// 预测市场结算并扣除手续费 (CPI only)
     fn process_prediction_market_settle_with_fee(
-        program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        locked_amount: u64,
-        settlement_amount: u64,
+        _program_id: &Pubkey,
+        _accounts: &[AccountInfo],
+        _locked_amount: u64,
+        _settlement_amount: u64,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let pm_user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-        let vault_token_account_info = next_account_info(account_info_iter)?;
-        let pm_fee_vault_info = next_account_info(account_info_iter)?;
-        let pm_fee_config_info = next_account_info(account_info_iter)?;
-        let _token_program_info = next_account_info(account_info_iter)?;
-
-        assert_writable(pm_user_account_info)?;
-        assert_writable(vault_token_account_info)?;
-        assert_writable(pm_fee_vault_info)?;
-
-        // 1. 验证 VaultConfig 和 CPI 调用方
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        // 2. 验证 Vault Token Account
-        if vault_token_account_info.key != &vault_config.vault_token_account {
-            msg!("❌ Invalid vault_token_account");
-            return Err(VaultError::InvalidAccount.into());
-        }
-
-        // 2.5 验证 PMFeeConfig PDA 地址（防伪造）
-        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
-
-        // 3. 读取 PM Fee Config 获取结算费率（只读，不写入 — PMFeeConfig 由 Fund 程序拥有）
-        const SETTLEMENT_FEE_BPS_OFFSET: usize = 49;
-        
-        let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
-        if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
-            msg!("❌ PM Fee Config not initialized");
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        let settlement_fee_bps = u16::from_le_bytes([
-            pm_fee_config_data[SETTLEMENT_FEE_BPS_OFFSET],
-            pm_fee_config_data[SETTLEMENT_FEE_BPS_OFFSET + 1],
-        ]);
-        
-        // 验证 PM Fee Vault
-        let expected_fee_vault = Pubkey::new_from_array(
-            pm_fee_config_data[pm_fee_config_offsets::FEE_VAULT..pm_fee_config_offsets::FEE_VAULT + 32]
-                .try_into()
-                .unwrap()
-        );
-        
-        if pm_fee_vault_info.key != &expected_fee_vault {
-            msg!("❌ PM Fee Vault mismatch");
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        drop(pm_fee_config_data);
-
-        // 4. 计算 fee 和 net_settlement
-        let fee_amount = ((settlement_amount as u128) * (settlement_fee_bps as u128) / 10000) as u64;
-        let net_settlement = settlement_amount.saturating_sub(fee_amount);
-        
-        msg!("PM Settle with Fee: locked={}, settlement={}, fee_bps={}, fee={}, net={}", 
-             locked_amount, settlement_amount, settlement_fee_bps, fee_amount, net_settlement);
-
-        // 5. 从 PMUserAccount 扣除 locked_amount，记入 net_settlement
-        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
-        
-        // 扣除 locked
-        pm_user_account.prediction_market_locked_e6 = checked_sub(
-            pm_user_account.prediction_market_locked_e6,
-            locked_amount as i64
-        )?;
-        
-        // 增加 pending_settlement (净额)
-        pm_user_account.prediction_market_pending_settlement_e6 = checked_add(
-            pm_user_account.prediction_market_pending_settlement_e6,
-            net_settlement as i64
-        )?;
-        
-        pm_user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
-
-        // 6. 如果有 fee，执行 Token Transfer
-        if fee_amount > 0 {
-            let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(
-                &[b"vault_config"],
-                program_id,
-            );
-            
-            if vault_config_info.key != &vault_config_pda {
-                msg!("❌ Invalid VaultConfig PDA");
-                return Err(VaultError::InvalidPda.into());
-            }
-            
-            let _vault_config_seeds: &[&[u8]] = &[b"vault_config", &[vault_config_bump]];
-            
-            // 纯记账模式：USDC 留在主金库，fee = settlement - net_settlement
-            msg!("PM settlement fee {} recorded (pure accounting, no transfer)", fee_amount);
-            let _ = pm_fee_vault_info;
-        }
-
-        msg!("✅ PredictionMarketSettleWithFee completed: locked={}, settlement={}, fee={}, net={}", 
-             locked_amount, settlement_amount, fee_amount, net_settlement);
-        Ok(())
+        msg!("❌ PredictionMarketSettleWithFee is deprecated (DB-First + PM Program deprecated). Rejecting.");
+        Err(VaultError::DeprecatedInstruction.into())
     }
 
     // =========================================================================
@@ -2404,14 +1819,6 @@ impl Processor {
     // =========================================================================
 
     /// [DEPRECATED] InitializeSpotUser — returns error
-    fn process_initialize_spot_user(
-        _program_id: &Pubkey,
-        _accounts: &[AccountInfo],
-    ) -> ProgramResult {
-        msg!("❌ InitializeSpotUser is deprecated. SpotTokenBalance PDAs are auto-initialized on first deposit.");
-        Err(VaultError::DeprecatedInstruction.into())
-    }
-
     /// Spot Token 入金 (用户直接调用)
     /// Accounts: user(signer) + balance_pda(w) + user_token + vault_token + vault_config + token_program + system_program
     fn process_spot_deposit(
@@ -2440,6 +1847,12 @@ impl Processor {
         let system_program = next_account_info(account_info_iter)?;
 
         assert_signer(user)?;
+
+        // V-1: Verify token_program is a known SPL Token program
+        if !token_compat::is_valid_token_program(token_program.key) {
+            msg!("❌ Invalid token program: expected SPL Token or Token-2022");
+            return Err(VaultError::InvalidAccount.into());
+        }
 
         // S-1: Verify VaultConfig PDA
         let (expected_vault_config_pda, _) = Pubkey::find_program_address(&[b"vault_config"], program_id);
@@ -2528,6 +1941,12 @@ impl Processor {
         let token_program = next_account_info(account_info_iter)?;
 
         assert_signer(user)?;
+
+        // V-1: Verify token_program is a known SPL Token program
+        if !token_compat::is_valid_token_program(token_program.key) {
+            msg!("❌ Invalid token program: expected SPL Token or Token-2022");
+            return Err(VaultError::InvalidAccount.into());
+        }
 
         Self::verify_spot_balance_pda(balance_pda_info, program_id, user.key, account_index, token_index)?;
 
@@ -2651,19 +2070,6 @@ impl Processor {
     }
 
     /// [DEPRECATED] SpotSettleTrade (CPI-only) — use RelayerSpotSettleTrade
-    fn process_spot_settle_trade(
-        _accounts: &[AccountInfo],
-        _is_buy: bool,
-        _base_token_index: u16,
-        _quote_token_index: u16,
-        _base_amount: u64,
-        _quote_amount: u64,
-        _sequence: u64,
-    ) -> ProgramResult {
-        msg!("❌ SpotSettleTrade (CPI) is deprecated. Use RelayerSpotSettleTrade.");
-        Err(VaultError::DeprecatedInstruction.into())
-    }
-
     /// Relayer 代理 Spot 入金
     /// Accounts: admin(signer) + balance_pda(w) + vault_config + system_program
     fn process_relayer_spot_deposit(
@@ -3543,84 +2949,19 @@ impl Processor {
         Ok(())
     }
 
-    /// PM SettleToAvailableWithFee — 结算到 available_balance 并收取手续费（一步完成）
-    ///
-    /// 与 SettleToAvailable(43) 相同逻辑但扣除 settlement fee。
-    /// fee = settlement_amount * settlement_fee_bps / 10000
-    /// net = settlement_amount - fee
-    /// pm_locked -= locked_amount, available_balance += net
-    /// fee 留在主金库（纯记账模式）
-    ///
-    /// Accounts: vault_config, user_account, pm_user_account, caller_program, pm_fee_config
     fn process_prediction_market_settle_to_available_with_fee(
         _program_id: &Pubkey,
-        accounts: &[AccountInfo],
-        locked_amount: u64,
-        settlement_amount: u64,
+        _accounts: &[AccountInfo],
+        _locked_amount: u64,
+        _settlement_amount: u64,
     ) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let vault_config_info = next_account_info(account_info_iter)?;
-        let user_account_info = next_account_info(account_info_iter)?;
-        let pm_user_account_info = next_account_info(account_info_iter)?;
-        let caller_program = next_account_info(account_info_iter)?;
-        let pm_fee_config_info = next_account_info(account_info_iter)?;
-
-        assert_writable(user_account_info)?;
-        assert_writable(pm_user_account_info)?;
-
-        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        verify_cpi_caller(&vault_config, caller_program)?;
-
-        Self::verify_pm_fee_config_pda(pm_fee_config_info, &vault_config)?;
-
-        // Read settlement fee rate from PMFeeConfig (owned by Fund program, read-only)
-        const SETTLEMENT_FEE_BPS_OFFSET: usize = 49;
-        let pm_fee_config_data = pm_fee_config_info.try_borrow_data()?;
-        if pm_fee_config_data.len() < pm_fee_config_offsets::MIN_SIZE {
-            msg!("❌ PM Fee Config not initialized");
-            return Err(VaultError::InvalidAccount.into());
-        }
-
-        let settlement_fee_bps = u16::from_le_bytes([
-            pm_fee_config_data[SETTLEMENT_FEE_BPS_OFFSET],
-            pm_fee_config_data[SETTLEMENT_FEE_BPS_OFFSET + 1],
-        ]);
-        drop(pm_fee_config_data);
-
-        let fee_amount = ((settlement_amount as u128) * (settlement_fee_bps as u128) / 10000) as u64;
-        let net_settlement = settlement_amount.saturating_sub(fee_amount);
-
-        // Release locked amount from PMUserAccount
-        let mut pm_user_account = deserialize_account::<PredictionMarketUserAccount>(&pm_user_account_info.data.borrow())?;
-        if locked_amount > 0 {
-            if pm_user_account.prediction_market_locked_e6 < locked_amount as i64 {
-                msg!("SettleToAvailableWithFee: insufficient pm_locked {} < {}",
-                     pm_user_account.prediction_market_locked_e6, locked_amount);
-                return Err(VaultError::InsufficientMargin.into());
-            }
-            pm_user_account.prediction_market_locked_e6 = checked_sub(pm_user_account.prediction_market_locked_e6, locked_amount as i64)?;
-        }
-        pm_user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        pm_user_account.serialize(&mut &mut pm_user_account_info.data.borrow_mut()[..])?;
-
-        // Credit net settlement to UserAccount.available_balance
-        let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
-        if user_account.wallet != pm_user_account.wallet {
-            msg!("SettleToAvailableWithFee: wallet mismatch user={} pm={}",
-                 user_account.wallet, pm_user_account.wallet);
-            return Err(VaultError::InvalidAccount.into());
-        }
-        if net_settlement > 0 {
-            user_account.available_balance_e6 = checked_add(user_account.available_balance_e6, net_settlement as i64)?;
-        }
-        user_account.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-        user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
-
-        msg!("PM SettleToAvailableWithFee: locked={}, settlement={}, fee_bps={}, fee={}, net={}",
-             locked_amount, settlement_amount, settlement_fee_bps, fee_amount, net_settlement);
-        msg!("PM settlement fee {} recorded (pure accounting, no transfer)", fee_amount);
-        Ok(())
+        msg!("❌ PredictionMarketSettleToAvailableWithFee is deprecated (DB-First + PM Program deprecated). Rejecting.");
+        Err(VaultError::DeprecatedInstruction.into())
     }
+
+    // =========================================================================
+    // Bond: PM Oracle 保证金锁定/释放
+    // =========================================================================
 
     /// Process LockBond — CPI only, called by Exchange Program for PM Oracle proposals
     fn process_lock_bond(accounts: &[AccountInfo], amount_e6: u64) -> ProgramResult {
@@ -3684,8 +3025,22 @@ impl Processor {
         Ok(())
     }
 
+    // =========================================================================
+    // Sync: DB -> 链上状态镜像 (Recording Queue)
+    // =========================================================================
+
     /// Sync UserAccount PDA from DB state (set-to-value, not increment).
     /// Relayer-only. Used by recording_queue worker to mirror DB → chain.
+    ///
+    /// # Relayer Verification Design (H-3)
+    ///
+    /// Vault uses `VaultConfig.admin` (single key) for relayer authorization,
+    /// while Exchange uses an `authorized_relayers` list. This is intentional:
+    /// - Current deployment has exactly one Relayer key per environment.
+    /// - Vault admin == Relayer in all three environments (local/staging/mainnet).
+    /// - If multi-Relayer support is needed in the future, add an
+    ///   `authorized_relayers: Vec<Pubkey>` field to VaultConfig and upgrade
+    ///   the on-chain program. This is a low-risk future change.
     fn process_sync_user_account(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
@@ -3694,6 +3049,7 @@ impl Processor {
         available_balance_e6: i64,
         locked_margin_e6: i64,
         spot_locked_e6: i64,
+        oracle_locked_e6: i64,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
@@ -3749,7 +3105,7 @@ impl Processor {
                 last_update_ts: solana_program::clock::Clock::get()?.unix_timestamp,
                 spot_locked_e6,
                 account_index,
-                oracle_locked_e6: 0,
+                oracle_locked_e6,
                 reserved: [0; 47],
             };
             user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
@@ -3769,12 +3125,13 @@ impl Processor {
             user_account.available_balance_e6 = available_balance_e6;
             user_account.locked_margin_e6 = locked_margin_e6;
             user_account.spot_locked_e6 = spot_locked_e6;
+            user_account.oracle_locked_e6 = oracle_locked_e6;
             user_account.last_update_ts = current_ts;
             user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
         }
 
-        msg!("SyncUserAccount: wallet={} idx={} avail={} locked={} spot={}",
-            user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6);
+        msg!("SyncUserAccount: wallet={} idx={} avail={} locked={} spot={} oracle={}",
+            user_wallet, account_index, available_balance_e6, locked_margin_e6, spot_locked_e6, oracle_locked_e6);
         Ok(())
     }
 
