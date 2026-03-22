@@ -18,32 +18,11 @@ const RPC_URL = 'https://rpc.1024chain.com';
 const FAUCET_KEY_PATH = '/Users/chuciqin/Desktop/project1024/1024codebase/1024chain-config-production/keys/mainnet/node1/faucet.json';
 const RELAYER1_KEY_PATH = '/Users/chuciqin/Desktop/project1024/1024codebase/1024chain-config-production/keys/mainnet/node1/relayers/relayer1.json';
 
-const PROGRAMS = [
-  {
-    name: 'Exchange Ledger',
-    programId: 'HxRwFXgocnAcd2bFqmbPaahtWbpnVq7epjBH619GHmW9',
-    configPda: '3suH3cRwMhoWTSfZ7N5XAL3qzHJubFtpxUV8DNZ4Gj8q',
-    updateAdminIx: 14,
-    // accounts: [signer] admin, [writable] LedgerConfig
-    extraAccounts: false,
-  },
-  {
-    name: 'Fund (UpdateAuthority)',
-    programId: '35wKdvZ48HDu1rnpJEYkXufeGkNpsW1L25ZAmse7PUyM',
-    configPda: '8jifjta1C9M9F5EjaPsY2ak7PaTo6yn36eqEjcsjGiiy',
-    updateAdminIx: 11,
-    // accounts: [signer] authority, [writable] FundConfig, [] new_authority
-    extraAccounts: true, // needs new_authority as 3rd account
-  },
-  {
-    name: 'Listing',
-    programId: 'HqDhtezfvhMJyqTy2ZX4pf311kTBzbufjM2wqDmbtq2w',
-    configPda: 'H8LE94mFYVpphjAyPXf6bc1RRZSBcVWfqjaDgVfwcQL4',
-    updateAdminIx: 1,
-    // accounts: [signer] admin, [writable] ListingConfig
-    extraAccounts: false,
-  },
-];
+// All deprecated programs (Exchange Ledger, Fund, Listing) have been removed.
+// Only Vault and Exchange programs remain active.
+// Vault admin is updated via its own UpdateAdmin instruction.
+// Exchange admin is updated via its own UpdateAdmin instruction.
+const PROGRAMS = [];
 
 async function main() {
   const connection = new Connection(RPC_URL, 'confirmed');

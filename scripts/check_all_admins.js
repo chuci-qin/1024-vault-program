@@ -11,31 +11,12 @@ const { Connection, PublicKey } = require('@solana/web3.js');
 const RPC_URL = 'https://rpc.1024chain.com';
 const EXPECTED_ADMIN = 'Ey5dD4Qzb5E8PM1aEh33CHgbVnvh8PuMVT9vaZwcCk5D'; // relayer1
 
+// Active program configs
 const CONFIGS = [
   {
     name: 'Vault',
     program: 'C3pDwbciRtrxDr2Qfuqw67EUb9DHBJsAnmhty1jfk9fF',
     configPda: 'DMjPWD5GBzxfeSeqiscqN3hNiJqzsk5QBJqkXv9tQjeC',
-  },
-  {
-    name: 'Exchange Ledger',
-    program: 'HxRwFXgocnAcd2bFqmbPaahtWbpnVq7epjBH619GHmW9',
-    configPda: '3suH3cRwMhoWTSfZ7N5XAL3qzHJubFtpxUV8DNZ4Gj8q',
-  },
-  {
-    name: 'Prediction Market',
-    program: 'ATxUQPdVbd8jDCN44qwitc8ojkF1cinhbCmcvmYWs9mq',
-    configPda: '3SsW8RAxmCc1ZutpdzXG8fCBLX29WgMtwwBDrxWN51Bf',
-  },
-  {
-    name: 'Fund',
-    program: '35wKdvZ48HDu1rnpJEYkXufeGkNpsW1L25ZAmse7PUyM',
-    configPda: '8jifjta1C9M9F5EjaPsY2ak7PaTo6yn36eqEjcsjGiiy',
-  },
-  {
-    name: 'Listing',
-    program: 'HqDhtezfvhMJyqTy2ZX4pf311kTBzbufjM2wqDmbtq2w',
-    configPda: 'H8LE94mFYVpphjAyPXf6bc1RRZSBcVWfqjaDgVfwcQL4',
   },
   {
     name: 'Relayer Config',
@@ -47,8 +28,32 @@ const CONFIGS = [
     program: 'C3pDwbciRtrxDr2Qfuqw67EUb9DHBJsAnmhty1jfk9fF',
     configPda: 'AKorCbEwThniCPCxXLS9cnUfRw3P3Am5KsbGxYMAwmGd',
   },
+];
+
+// Deprecated program configs — checked for informational purposes only
+const DEPRECATED_CONFIGS = [
   {
-    name: 'PM Fee Config',
+    name: '[DEPRECATED] Exchange Ledger',
+    program: 'HxRwFXgocnAcd2bFqmbPaahtWbpnVq7epjBH619GHmW9',
+    configPda: '3suH3cRwMhoWTSfZ7N5XAL3qzHJubFtpxUV8DNZ4Gj8q',
+  },
+  {
+    name: '[DEPRECATED] Prediction Market',
+    program: 'ATxUQPdVbd8jDCN44qwitc8ojkF1cinhbCmcvmYWs9mq',
+    configPda: '3SsW8RAxmCc1ZutpdzXG8fCBLX29WgMtwwBDrxWN51Bf',
+  },
+  {
+    name: '[DEPRECATED] Fund',
+    program: '35wKdvZ48HDu1rnpJEYkXufeGkNpsW1L25ZAmse7PUyM',
+    configPda: '8jifjta1C9M9F5EjaPsY2ak7PaTo6yn36eqEjcsjGiiy',
+  },
+  {
+    name: '[DEPRECATED] Listing',
+    program: 'HqDhtezfvhMJyqTy2ZX4pf311kTBzbufjM2wqDmbtq2w',
+    configPda: 'H8LE94mFYVpphjAyPXf6bc1RRZSBcVWfqjaDgVfwcQL4',
+  },
+  {
+    name: '[DEPRECATED] PM Fee Config',
     program: 'ATxUQPdVbd8jDCN44qwitc8ojkF1cinhbCmcvmYWs9mq',
     configPda: 'D8rwT8xYqQN1z6XBtzdpAWKxyyigT4kHoH3iLFUeyQ4K',
   },
@@ -66,7 +71,8 @@ async function main() {
 
   const results = [];
 
-  for (const cfg of CONFIGS) {
+  const ALL_CONFIGS = [...CONFIGS, ...DEPRECATED_CONFIGS];
+  for (const cfg of ALL_CONFIGS) {
     const pda = new PublicKey(cfg.configPda);
     try {
       const accountInfo = await connection.getAccountInfo(pda);

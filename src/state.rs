@@ -1,37 +1,30 @@
 //! Vault Program State Definitions
 //!
-//! Vault Program 职责: 纯用户资金托管 (用户的钱)
-//! 
-//! 架构原则:
-//! - Vault Program = 用户资金托管 (入金/出金/保证金)
-//! - Fund Program = 资金池管理 (保险基金/手续费/返佣等)
+//! Vault Program 职责: 纯用户资金托管 (入金/出金/保证金)
 //!
-//! 详见: onchain-program/vault_vs_fund.md
+//! 架构: DB-First + 实时链上审计
+//! 只保留两个链上程序: Vault (资金托管) + Exchange (审计记录)
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::pubkey::Pubkey;
 
 /// VaultConfig 账户大小 (bytes)
-/// 
-/// ⚠️ 重要：此结构必须与链上已部署的账户数据格式完全匹配！
-/// 链上账户大小: 569 bytes
 ///
-/// 修复记录 (2025-12-10):
-/// - authorized_callers 从 Vec<Pubkey> 改为 [Pubkey; 10] 固定大小数组
-/// - fund_program 从 Option<Pubkey> 改为 Pubkey
+/// 变更记录:
+/// - 2025-12-10: authorized_callers 从 Vec<Pubkey> 改为 [Pubkey; 10] 固定大小数组
+/// - 2026-03-15: 删除 ledger_program 和 fund_program 字段 (569 → 505 bytes)
+///   这两个程序已完全废弃，字段不再保留。链上数据通过 MigrateVaultConfig 指令迁移。
 pub const VAULT_CONFIG_SIZE: usize = 8 + // discriminator
     32 + // admin
     32 + // usdc_mint
     32 + // vault_token_account
     32 * 10 + // authorized_callers ([Pubkey; 10])
-    32 + // ledger_program
-    32 + // fund_program (Pubkey，不是 Option)
     32 + // delegation_program
     8 + // total_deposits
     8 + // total_locked
     1 + // is_paused
     32; // 预留空间
-// Total: 8 + 32 + 32 + 32 + 320 + 32 + 32 + 32 + 8 + 8 + 1 + 32 = 569 bytes ✓
+// Total: 8 + 32 + 32 + 32 + 320 + 32 + 8 + 8 + 1 + 32 = 505 bytes ✓
 
 /// UserAccount 账户大小 (bytes)
 ///
@@ -51,14 +44,11 @@ pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
     8 + // oracle_locked_e6 (V2: PM Oracle bond)
     47; // reserved (was 56, reduced by 1+8 for account_index+oracle_locked)
 
-/// Vault 全局配置
-/// 
-/// ⚠️ 重要：此结构必须与链上已部署的账户数据格式完全匹配！
-/// 链上账户大小: 569 bytes
+/// Vault 全局配置 (505 bytes)
 ///
-/// 修复记录 (2025-12-10):
-/// - authorized_callers 从 Vec<Pubkey> 改为 [Pubkey; 10] 固定大小数组
-/// - fund_program 从 Option<Pubkey> 改为 Pubkey
+/// 变更记录:
+/// - 2025-12-10: authorized_callers 从 Vec<Pubkey> 改为 [Pubkey; 10]
+/// - 2026-03-15: 删除 ledger_program 和 fund_program (569→505 bytes)
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct VaultConfig {
     /// 账户类型标识符 (8 bytes)
@@ -74,15 +64,7 @@ pub struct VaultConfig {
     pub vault_token_account: Pubkey,
     
     /// 授权调用 CPI 的 Program 列表 (320 bytes = 32 * 10)
-    /// ⚠️ 固定大小数组，不是 Vec！
     pub authorized_callers: [Pubkey; 10],
-    
-    /// Ledger Program ID (32 bytes)
-    pub ledger_program: Pubkey,
-    
-    /// Fund Program ID (32 bytes)
-    /// ⚠️ 不是 Option<Pubkey>，链上是直接的 Pubkey
-    pub fund_program: Pubkey,
     
     /// Delegation Program ID (32 bytes)
     pub delegation_program: Pubkey,
@@ -99,14 +81,15 @@ pub struct VaultConfig {
     /// 预留空间 (32 bytes)
     pub reserved: [u8; 32],
 }
-// Total: 8 + 32 + 32 + 32 + 320 + 32 + 32 + 32 + 8 + 8 + 1 + 32 = 569 bytes ✓
+// Total: 8 + 32 + 32 + 32 + 320 + 32 + 8 + 8 + 1 + 32 = 505 bytes ✓
+
+/// Old VaultConfig size before migration (ledger_program + fund_program removed)
+pub const VAULT_CONFIG_SIZE_V1: usize = 569;
 
 impl VaultConfig {
     pub const DISCRIMINATOR: u64 = 0x5641554C545F434F; // "VAULT_CO"
     
-    /// L4-3: Verify caller is authorized — only uses authorized_callers array.
-    /// Deprecated ledger_program and fund_program checks removed.
-    /// When these fields are set to Pubkey::default(), they cannot match any caller.
+    /// Verify caller is authorized via the authorized_callers array.
     pub fn is_authorized_caller(&self, caller: &Pubkey) -> bool {
         for authorized in &self.authorized_callers {
             if authorized != &Pubkey::default() && caller == authorized {
@@ -392,7 +375,7 @@ pub struct SpotTokenBalance {
     pub discriminator: u64,
     /// User wallet (redundant with PDA seeds, kept for defense-in-depth + getProgramAccounts scanning)
     pub wallet: Pubkey,
-    /// Token index (matches assets table and ListingProgram TokenRegistry)
+    /// Token index (matches DB assets table)
     pub token_index: u16,
     /// Available balance (e6 precision) — can be used for orders or withdrawal
     pub available_e6: i64,
@@ -692,8 +675,6 @@ mod tests {
 
     #[test]
     fn test_vault_config_authorized_caller() {
-        let ledger = Pubkey::new_unique();
-        let fund = Pubkey::new_unique();
         let other = Pubkey::new_unique();
         let authorized = Pubkey::new_unique();
         
@@ -706,8 +687,6 @@ mod tests {
             usdc_mint: Pubkey::new_unique(),
             vault_token_account: Pubkey::new_unique(),
             authorized_callers,
-            ledger_program: ledger,
-            fund_program: fund,
             delegation_program: Pubkey::new_unique(),
             total_deposits: 0,
             total_locked: 0,
@@ -715,13 +694,28 @@ mod tests {
             reserved: [0u8; 32],
         };
         
-        // is_authorized_caller only checks authorized_callers array,
-        // NOT ledger_program or fund_program fields (deprecated).
-        assert!(!config.is_authorized_caller(&ledger));
-        assert!(!config.is_authorized_caller(&fund));
         assert!(config.is_authorized_caller(&authorized));
         assert!(!config.is_authorized_caller(&other));
         assert!(!config.is_authorized_caller(&Pubkey::default()));
+    }
+
+    #[test]
+    fn test_vault_config_size() {
+        let config = VaultConfig {
+            discriminator: VaultConfig::DISCRIMINATOR,
+            admin: Pubkey::new_unique(),
+            usdc_mint: Pubkey::new_unique(),
+            vault_token_account: Pubkey::new_unique(),
+            authorized_callers: [Pubkey::default(); 10],
+            delegation_program: Pubkey::new_unique(),
+            total_deposits: 0,
+            total_locked: 0,
+            is_paused: false,
+            reserved: [0u8; 32],
+        };
+        let serialized = borsh::to_vec(&config).unwrap();
+        assert_eq!(serialized.len(), VAULT_CONFIG_SIZE, "VaultConfig must be 505 bytes");
+        assert_eq!(VAULT_CONFIG_SIZE, 505);
     }
 
     // === Prediction Market User Account Tests ===

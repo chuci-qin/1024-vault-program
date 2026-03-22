@@ -55,7 +55,7 @@ fn deserialize_account<T: BorshDeserialize>(data: &[u8]) -> Result<T, std::io::E
 
 /// 验证 CPI 调用方是否授权
 /// L4-2: Simplified CPI caller verification — only checks authorized_callers array.
-/// Removed deprecated ledger_config PDA derivation and ledger_program/fund_program checks.
+/// Removed deprecated checks — only uses authorized_callers array.
 fn verify_cpi_caller(
     vault_config: &VaultConfig,
     caller_program: &AccountInfo,
@@ -105,17 +105,13 @@ impl Processor {
         match instruction {
             // --- Core: 初始化、入金、出金 ---
             VaultInstruction::Initialize {
-                ledger_program,
                 delegation_program,
-                fund_program,
             } => {
                 msg!("Instruction: Initialize");
                 Self::process_initialize(
                     program_id,
                     accounts,
-                    ledger_program,
                     delegation_program,
-                    fund_program,
                 )
             }
             VaultInstruction::InitializeUser { account_index } => {
@@ -164,11 +160,11 @@ impl Processor {
                 msg!("Instruction: UpdateAdmin");
                 Self::process_update_admin(accounts, new_admin)
             }
-            VaultInstruction::SetFundProgram { fund_program } => {
-                msg!("Instruction: SetFundProgram");
-                Self::process_set_fund_program(accounts, fund_program)
+            VaultInstruction::Deprecated_SetFundProgram => {
+                msg!("Instruction: SetFundProgram — DEPRECATED, rejecting");
+                Err(ProgramError::InvalidInstructionData)
             }
-            VaultInstruction::SetLedgerProgram { .. } => {
+            VaultInstruction::Deprecated_SetLedgerProgram => {
                 msg!("Instruction: SetLedgerProgram — DEPRECATED, rejecting");
                 Err(ProgramError::InvalidInstructionData)
             }
@@ -386,6 +382,10 @@ impl Processor {
                 msg!("Instruction: SyncSpotTokenBalance");
                 Self::process_sync_spot_token_balance(program_id, accounts, user_wallet, account_index, token_index, available_e6, locked_e6)
             }
+            VaultInstruction::MigrateVaultConfig => {
+                msg!("Instruction: MigrateVaultConfig (V1 569→V2 505)");
+                Self::process_migrate_vault_config(program_id, accounts)
+            }
         }
     }
 
@@ -397,9 +397,7 @@ impl Processor {
     fn process_initialize(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
-        ledger_program: Pubkey,
         delegation_program: Pubkey,
-        fund_program: Pubkey,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
@@ -408,10 +406,8 @@ impl Processor {
         let vault_token_account = next_account_info(account_info_iter)?;
         let _system_program = next_account_info(account_info_iter)?;
 
-        // 验证admin签名
         assert_signer(admin)?;
 
-        // 创建VaultConfig PDA
         let (vault_config_pda, vault_config_bump) =
             Pubkey::find_program_address(&[b"vault_config"], program_id);
 
@@ -419,7 +415,6 @@ impl Processor {
             return Err(VaultError::InvalidPda.into());
         }
 
-        // 创建账户
         let rent = Rent::get()?;
         let space = VAULT_CONFIG_SIZE;
         let lamports = rent.minimum_balance(space);
@@ -441,15 +436,12 @@ impl Processor {
             &[&[b"vault_config", &[vault_config_bump]]],
         )?;
 
-        // 初始化数据
         let vault_config = VaultConfig {
             discriminator: VaultConfig::DISCRIMINATOR,
             admin: *admin.key,
             usdc_mint: *usdc_mint.key,
             vault_token_account: *vault_token_account.key,
-            authorized_callers: [Pubkey::default(); 10], // 固定大小数组
-            ledger_program,
-            fund_program, // 不再是 Option
+            authorized_callers: [Pubkey::default(); 10],
             delegation_program,
             total_deposits: 0,
             total_locked: 0,
@@ -460,8 +452,6 @@ impl Processor {
         vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
 
         msg!("Vault initialized");
-        msg!("Ledger Program: {}", ledger_program);
-        msg!("Fund Program: {}", fund_program);
         msg!("Delegation Program: {}", delegation_program);
         Ok(())
     }
@@ -790,26 +780,8 @@ impl Processor {
         Ok(())
     }
     
-    fn process_set_fund_program(accounts: &[AccountInfo], fund_program: Pubkey) -> ProgramResult {
-        let account_info_iter = &mut accounts.iter();
-        let admin = next_account_info(account_info_iter)?;
-        let vault_config_info = next_account_info(account_info_iter)?;
-
-        assert_signer(admin)?;
-        assert_writable(vault_config_info)?;
-
-        let mut vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        
-        if vault_config.admin != *admin.key {
-            return Err(VaultError::InvalidAdmin.into());
-        }
-
-        vault_config.fund_program = fund_program;
-        vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
-
-        msg!("Fund program set to: {}", fund_program);
-        Ok(())
-    }
+    // process_set_fund_program and process_set_ledger_program removed.
+    // Both programs are fully deprecated. Fields removed from VaultConfig.
     
     /// Admin 强制释放用户锁定保证金
     /// 
@@ -2682,11 +2654,11 @@ impl Processor {
             return Err(VaultError::MissingSignature.into());
         }
 
-        // 2. 验证 VaultConfig 并确认 caller 是 Fund Program
+        // 2. 验证 VaultConfig 并确认 caller 是 authorized caller
+        // Verify caller is in authorized_callers array
         let vault_config: VaultConfig = deserialize_account(&vault_config_info.data.borrow())?;
-        if vault_config.fund_program != *caller_info.key {
-            msg!("❌ CreditUserBalance: caller {} is not Fund Program {}", 
-                caller_info.key, vault_config.fund_program);
+        if !vault_config.is_authorized_caller(caller_info.key) {
+            msg!("❌ CreditUserBalance: caller {} is not an authorized caller", caller_info.key);
             return Err(VaultError::UnauthorizedCaller.into());
         }
 
@@ -3192,6 +3164,84 @@ impl Processor {
 
         msg!("SyncSpotTokenBalance: wallet={} idx={} token={} avail={} locked={}",
             user_wallet, account_index, token_index, available_e6, locked_e6);
+        Ok(())
+    }
+
+    /// Migrate VaultConfig from V1 (569 bytes) to V2 (505 bytes).
+    ///
+    /// Removes the deprecated ledger_program (32 bytes) and fund_program (32 bytes)
+    /// fields from the on-chain data, compacting the account.
+    ///
+    /// V1 layout (569 bytes):
+    ///   disc(8) + admin(32) + usdc_mint(32) + vault_token_account(32)
+    ///   + authorized_callers(320) + ledger_program(32) + fund_program(32)
+    ///   + delegation_program(32) + total_deposits(8) + total_locked(8)
+    ///   + is_paused(1) + reserved(32)
+    ///
+    /// V2 layout (505 bytes):
+    ///   disc(8) + admin(32) + usdc_mint(32) + vault_token_account(32)
+    ///   + authorized_callers(320) + delegation_program(32)
+    ///   + total_deposits(8) + total_locked(8) + is_paused(1) + reserved(32)
+    fn process_migrate_vault_config(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> ProgramResult {
+        let account_info_iter = &mut accounts.iter();
+        let admin = next_account_info(account_info_iter)?;
+        let vault_config_info = next_account_info(account_info_iter)?;
+        let _system_program = next_account_info(account_info_iter)?;
+
+        assert_signer(admin)?;
+
+        let (vault_config_pda, _) =
+            Pubkey::find_program_address(&[b"vault_config"], program_id);
+        if vault_config_info.key != &vault_config_pda {
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        let data = vault_config_info.data.borrow();
+        let current_len = data.len();
+
+        if current_len == VAULT_CONFIG_SIZE {
+            msg!("VaultConfig already migrated to V2 (505 bytes)");
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if current_len != VAULT_CONFIG_SIZE_V1 {
+            msg!("VaultConfig unexpected size: {} (expected V1={})", current_len, VAULT_CONFIG_SIZE_V1);
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Verify admin matches stored admin (bytes 8..40)
+        let stored_admin = Pubkey::try_from(&data[8..40])
+            .map_err(|_| ProgramError::InvalidAccountData)?;
+        if &stored_admin != admin.key {
+            msg!("MigrateVaultConfig: admin mismatch");
+            return Err(VaultError::UnauthorizedUser.into());
+        }
+
+        // Parse V1 data by byte offsets:
+        // [0..424]   = disc + admin + usdc_mint + vault_token_account + authorized_callers
+        // [424..456] = ledger_program (SKIP)
+        // [456..488] = fund_program (SKIP)
+        // [488..569] = delegation_program(32) + total_deposits(8) + total_locked(8) + is_paused(1) + reserved(32)
+        let prefix = data[0..424].to_vec();     // 424 bytes (before ledger_program)
+        let suffix = data[488..569].to_vec();   // 81 bytes (delegation_program onward)
+        drop(data);
+
+        // Compact: prefix(424) + suffix(81) = 505 bytes
+        let mut new_data = Vec::with_capacity(VAULT_CONFIG_SIZE);
+        new_data.extend_from_slice(&prefix);
+        new_data.extend_from_slice(&suffix);
+        assert_eq!(new_data.len(), VAULT_CONFIG_SIZE);
+
+        // Realloc the account to 505 bytes
+        vault_config_info.realloc(VAULT_CONFIG_SIZE, false)?;
+
+        // Write the compacted data
+        vault_config_info.data.borrow_mut()[..VAULT_CONFIG_SIZE].copy_from_slice(&new_data);
+
+        msg!("MigrateVaultConfig: success (569 → 505 bytes)");
         Ok(())
     }
 }

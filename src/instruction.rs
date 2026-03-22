@@ -1,7 +1,7 @@
 //! Vault Program Instructions
 //!
 //! Vault Program 职责: 纯用户资金托管
-//! 保险基金相关操作已迁移到 Fund Program
+//! 只保留两个链上程序: Vault (资金托管) + Exchange (审计记录)
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::pubkey::Pubkey;
@@ -20,12 +20,8 @@ pub enum VaultInstruction {
     /// 5. `[]` Token Program
     /// 6. `[]` Rent Sysvar
     Initialize {
-        /// Ledger Program ID
-        ledger_program: Pubkey,
         /// Delegation Program ID
         delegation_program: Pubkey,
-        /// Fund Program ID (用于 CPI 调用保险基金等)
-        fund_program: Pubkey,
     },
 
     /// 初始化用户账户
@@ -169,25 +165,15 @@ pub enum VaultInstruction {
         new_admin: Pubkey,
     },
     
-    /// 设置 Fund Program (Admin only)
-    /// 
-    /// Accounts:
-    /// 0. `[signer]` Admin
-    /// 1. `[writable]` VaultConfig
-    SetFundProgram {
-        /// Fund Program ID
-        fund_program: Pubkey,
-    },
+    /// [DEPRECATED] SetFundProgram — Fund Program is deprecated.
+    /// Kept as unit variant to preserve Borsh enum index (12).
+    #[allow(non_camel_case_types)]
+    Deprecated_SetFundProgram,
 
-    /// 设置 Ledger Program (Admin only)
-    /// 
-    /// Accounts:
-    /// 0. `[signer]` Admin
-    /// 1. `[writable]` VaultConfig
-    SetLedgerProgram {
-        /// Ledger Program ID
-        ledger_program: Pubkey,
-    },
+    /// [DEPRECATED] SetLedgerProgram — Ledger Program is deprecated.
+    /// Kept as unit variant to preserve Borsh enum index (13).
+    #[allow(non_camel_case_types)]
+    Deprecated_SetLedgerProgram,
 
     /// Admin 强制释放用户锁定保证金 (Admin only)
     /// 
@@ -982,5 +968,16 @@ pub enum VaultInstruction {
         available_e6: i64,
         locked_e6: i64,
     },
+
+    /// Index 54: Migrate VaultConfig from V1 (569 bytes) to V2 (505 bytes)
+    ///
+    /// Removes deprecated ledger_program and fund_program fields.
+    /// Admin-only, can only run once (fails on already-migrated accounts).
+    ///
+    /// Accounts:
+    /// 0. `[signer]` Admin
+    /// 1. `[writable]` VaultConfig PDA
+    /// 2. `[]` System Program
+    MigrateVaultConfig,
 }
 

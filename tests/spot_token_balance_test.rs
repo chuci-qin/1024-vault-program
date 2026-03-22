@@ -64,9 +64,7 @@ async fn initialize_vault_config(
 ) {
     let (vault_config_pda, _) = derive_vault_config_pda(program_id);
 
-    let ledger = Pubkey::new_unique();
     let delegation = Pubkey::new_unique();
-    let fund = Pubkey::new_unique();
     let usdc_mint = Pubkey::new_unique();
     let vault_token_account = Pubkey::new_unique();
 
@@ -80,9 +78,7 @@ async fn initialize_vault_config(
             AccountMeta::new_readonly(system_program::id(), false),
         ],
         data: VaultInstruction::Initialize {
-            ledger_program: ledger,
             delegation_program: delegation,
-            fund_program: fund,
         }
         .try_to_vec()
         .unwrap(),
