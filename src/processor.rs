@@ -230,13 +230,13 @@ impl Processor {
                 msg!("Instruction: Deprecated_InitializeSpotUser — DEPRECATED");
                 Err(VaultError::DeprecatedInstruction.into())
             }
-            VaultInstruction::SpotDeposit { token_index, amount, account_index } => {
+            VaultInstruction::SpotDeposit { token_index, amount, account_index, amount_e6 } => {
                 msg!("Instruction: SpotDeposit");
-                Self::process_spot_deposit(program_id, accounts, token_index, amount, account_index)
+                Self::process_spot_deposit(program_id, accounts, token_index, amount, account_index, amount_e6)
             }
-            VaultInstruction::SpotWithdraw { token_index, amount, account_index } => {
+            VaultInstruction::SpotWithdraw { token_index, amount, account_index, amount_e6 } => {
                 msg!("Instruction: SpotWithdraw");
-                Self::process_spot_withdraw(program_id, accounts, token_index, amount, account_index)
+                Self::process_spot_withdraw(program_id, accounts, token_index, amount, account_index, amount_e6)
             }
             VaultInstruction::SpotLockBalance { token_index, amount, account_index: _ } => {
                 msg!("Instruction: SpotLockBalance");
@@ -250,13 +250,13 @@ impl Processor {
                 msg!("Instruction: Deprecated_SpotSettleTrade — DEPRECATED");
                 Err(VaultError::DeprecatedInstruction.into())
             }
-            VaultInstruction::RelayerSpotDeposit { user_wallet, token_index, amount, account_index } => {
+            VaultInstruction::RelayerSpotDeposit { user_wallet, token_index, amount, account_index, amount_e6 } => {
                 msg!("Instruction: RelayerSpotDeposit");
-                Self::process_relayer_spot_deposit(program_id, accounts, user_wallet, token_index, amount, account_index)
+                Self::process_relayer_spot_deposit(program_id, accounts, user_wallet, token_index, amount, account_index, amount_e6)
             }
-            VaultInstruction::RelayerSpotWithdraw { user_wallet, token_index, amount, account_index } => {
+            VaultInstruction::RelayerSpotWithdraw { user_wallet, token_index, amount, account_index, amount_e6 } => {
                 msg!("Instruction: RelayerSpotWithdraw");
-                Self::process_relayer_spot_withdraw(program_id, accounts, user_wallet, token_index, amount, account_index)
+                Self::process_relayer_spot_withdraw(program_id, accounts, user_wallet, token_index, amount, account_index, amount_e6)
             }
             
             // Spot 统一账户指令 (2025-12-31 新增)
@@ -1799,13 +1799,15 @@ impl Processor {
         token_index: u16,
         amount: u64,
         account_index: u8,
+        amount_e6: i64,
     ) -> ProgramResult {
         if token_index == 0 {
             msg!("❌ USDC (token_index=0) must use Vault.Deposit, not SpotDeposit. Use Vault instruction #2.");
             return Err(VaultError::QuoteAssetMustUseVaultPath.into());
         }
 
-        if amount == 0 {
+        if amount == 0 || amount_e6 <= 0 {
+            msg!("❌ Invalid amount: native={}, e6={}", amount, amount_e6);
             return Err(VaultError::InvalidAmount.into());
         }
         
@@ -1878,11 +1880,11 @@ impl Processor {
             token_program, user_token_account, vault_token_account, user, amount, None,
         )?;
 
-        balance.available_e6 = balance.available_e6.checked_add(amount as i64).ok_or(VaultError::Overflow)?;
+        balance.available_e6 = balance.available_e6.checked_add(amount_e6).ok_or(VaultError::Overflow)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
 
-        msg!("✅ SpotDeposit: token_index={}, amount={}", token_index, amount);
+        msg!("✅ SpotDeposit: token_index={}, amount_native={}, amount_e6={}", token_index, amount, amount_e6);
         Ok(())
     }
 
@@ -1894,13 +1896,15 @@ impl Processor {
         token_index: u16,
         amount: u64,
         account_index: u8,
+        amount_e6: i64,
     ) -> ProgramResult {
         if token_index == 0 {
             msg!("❌ USDC (token_index=0) must use Vault.Withdraw, not SpotWithdraw. Use Vault instruction #3.");
             return Err(VaultError::QuoteAssetMustUseVaultPath.into());
         }
 
-        if amount == 0 {
+        if amount == 0 || amount_e6 <= 0 {
+            msg!("❌ Invalid amount: native={}, e6={}", amount, amount_e6);
             return Err(VaultError::InvalidAmount.into());
         }
         
@@ -1923,12 +1927,12 @@ impl Processor {
         Self::verify_spot_balance_pda(balance_pda_info, program_id, user.key, account_index, token_index)?;
 
         let mut balance = deserialize_account::<SpotTokenBalance>(&balance_pda_info.data.borrow())?;
-        if balance.available_e6 < amount as i64 {
-            msg!("❌ Insufficient balance: available={}, required={}", balance.available_e6, amount);
+        if balance.available_e6 < amount_e6 {
+            msg!("❌ Insufficient balance: available_e6={}, required_e6={}", balance.available_e6, amount_e6);
             return Err(VaultError::InsufficientBalance.into());
         }
 
-        balance.available_e6 = checked_sub(balance.available_e6, amount as i64)?;
+        balance.available_e6 = checked_sub(balance.available_e6, amount_e6)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
 
         let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(&[b"vault_config"], program_id);
@@ -1971,7 +1975,7 @@ impl Processor {
         )?;
 
         balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
-        msg!("✅ SpotWithdraw: token_index={}, amount={}", token_index, amount);
+        msg!("✅ SpotWithdraw: token_index={}, amount_native={}, amount_e6={}", token_index, amount, amount_e6);
         Ok(())
     }
 
@@ -2051,11 +2055,16 @@ impl Processor {
         token_index: u16,
         amount: u64,
         account_index: u8,
+        amount_e6: i64,
     ) -> ProgramResult {
-        // One Account Experience: USDC 必须通过 RelayerDeposit，不能通过 RelayerSpotDeposit
         if token_index == 0 {
             msg!("❌ USDC (token_index=0) must use RelayerDeposit (#25), not RelayerSpotDeposit.");
             return Err(VaultError::QuoteAssetMustUseVaultPath.into());
+        }
+
+        if amount_e6 <= 0 {
+            msg!("❌ Invalid amount_e6: {} (must be positive)", amount_e6);
+            return Err(VaultError::InvalidAmount.into());
         }
         
         let account_info_iter = &mut accounts.iter();
@@ -2075,16 +2084,17 @@ impl Processor {
             admin, balance_pda_info, system_program, program_id, &user_wallet, account_index, token_index, bump,
         )?;
 
-        balance.available_e6 = balance.available_e6.checked_add(amount as i64).ok_or(VaultError::Overflow)?;
+        balance.available_e6 = balance.available_e6.checked_add(amount_e6).ok_or(VaultError::Overflow)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
 
-        msg!("✅ RelayerSpotDeposit: user={}, token_index={}, amount={}", user_wallet, token_index, amount);
+        msg!("✅ RelayerSpotDeposit: user={}, token_index={}, amount_native={}, amount_e6={}", user_wallet, token_index, amount, amount_e6);
         Ok(())
     }
 
-    /// Relayer 代理 Spot 出金
-    /// Accounts: admin(signer) + balance_pda(w) + vault_config
+    /// Relayer 代理 Spot 出金 (with SPL token transfer)
+    /// Accounts: admin(signer) + balance_pda(w) + vault_config + vault_token_account(w) + user_token_account(w) + token_program
+    /// If only 3 accounts are passed (legacy), PDA is debited without SPL transfer (backward-compat).
     fn process_relayer_spot_withdraw(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
@@ -2092,13 +2102,18 @@ impl Processor {
         token_index: u16,
         amount: u64,
         account_index: u8,
+        amount_e6: i64,
     ) -> ProgramResult {
-        // One Account Experience: USDC 必须通过 RelayerWithdraw，不能通过 RelayerSpotWithdraw
         if token_index == 0 {
             msg!("❌ USDC (token_index=0) must use RelayerWithdraw (#26), not RelayerSpotWithdraw.");
             return Err(VaultError::QuoteAssetMustUseVaultPath.into());
         }
-        
+
+        if amount_e6 <= 0 {
+            msg!("❌ Invalid amount_e6: {} (must be positive)", amount_e6);
+            return Err(VaultError::InvalidAmount.into());
+        }
+
         let account_info_iter = &mut accounts.iter();
         let admin = next_account_info(account_info_iter)?;
         let balance_pda_info = next_account_info(account_info_iter)?;
@@ -2112,14 +2127,69 @@ impl Processor {
 
         Self::verify_spot_balance_pda(balance_pda_info, program_id, &user_wallet, account_index, token_index)?;
         let mut balance = deserialize_account::<SpotTokenBalance>(&balance_pda_info.data.borrow())?;
-        if balance.available_e6 < amount as i64 {
+        if balance.available_e6 < amount_e6 {
+            msg!("❌ Insufficient balance: available_e6={}, required_e6={}", balance.available_e6, amount_e6);
             return Err(VaultError::InsufficientBalance.into());
         }
-        balance.available_e6 = checked_sub(balance.available_e6, amount as i64)?;
+        balance.available_e6 = checked_sub(balance.available_e6, amount_e6)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
         balance.serialize(&mut &mut balance_pda_info.data.borrow_mut()[..])?;
 
-        msg!("✅ RelayerSpotWithdraw: user={}, token_index={}, amount={}", user_wallet, token_index, amount);
+        // SPL token transfer: if additional accounts are provided, transfer real tokens.
+        let vault_token_account = next_account_info(account_info_iter);
+        if let Ok(vault_ta) = vault_token_account {
+            let user_token_account = next_account_info(account_info_iter)?;
+            let token_program = next_account_info(account_info_iter)?;
+
+            if !token_compat::is_valid_token_program(token_program.key) {
+                msg!("❌ Invalid token program for RelayerSpotWithdraw transfer");
+                return Err(VaultError::InvalidAccount.into());
+            }
+
+            let (vault_config_pda, vault_config_bump) =
+                Pubkey::find_program_address(&[b"vault_config"], program_id);
+            if vault_config_info.key != &vault_config_pda {
+                return Err(VaultError::InvalidPda.into());
+            }
+
+            let vault_ta_data = vault_ta.try_borrow_data()?;
+            if vault_ta_data.len() < 64 {
+                msg!("❌ vault_token_account is not a valid SPL token account");
+                return Err(VaultError::InvalidAccount.into());
+            }
+            let vault_ta_mint = Pubkey::try_from(&vault_ta_data[0..32])
+                .map_err(|_| VaultError::InvalidAccount)?;
+            let vault_ta_owner = Pubkey::try_from(&vault_ta_data[32..64])
+                .map_err(|_| VaultError::InvalidAccount)?;
+            if vault_ta_owner != vault_config_pda {
+                msg!("❌ vault_token_account not owned by vault_config PDA");
+                return Err(VaultError::InvalidAccount.into());
+            }
+            drop(vault_ta_data);
+
+            let user_ta_data = user_token_account.try_borrow_data()?;
+            if user_ta_data.len() < 32 {
+                return Err(VaultError::InvalidAccount.into());
+            }
+            let user_ta_mint = Pubkey::try_from(&user_ta_data[0..32])
+                .map_err(|_| VaultError::InvalidAccount)?;
+            drop(user_ta_data);
+
+            if user_ta_mint != vault_ta_mint {
+                msg!("❌ Mint mismatch: user={}, vault={}", user_ta_mint, vault_ta_mint);
+                return Err(VaultError::InvalidAccount.into());
+            }
+
+            token_compat::transfer(
+                token_program, vault_ta, user_token_account, vault_config_info, amount,
+                Some(&[b"vault_config", &[vault_config_bump]]),
+            )?;
+
+            msg!("✅ RelayerSpotWithdraw+Transfer: user={}, token_index={}, amount_native={}, amount_e6={}", user_wallet, token_index, amount, amount_e6);
+        } else {
+            msg!("✅ RelayerSpotWithdraw (PDA-only): user={}, token_index={}, amount_e6={}", user_wallet, token_index, amount_e6);
+        }
+
         Ok(())
     }
 

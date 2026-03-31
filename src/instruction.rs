@@ -455,10 +455,12 @@ pub enum VaultInstruction {
     SpotDeposit {
         /// Token 索引 (来自 Listing Program TokenRegistry)
         token_index: u16,
-        /// 入金金额 (e6 或原生精度)
+        /// 入金金额 (native precision, e.g. satoshi for wBTC) — used for SPL token transfer
         amount: u64,
         /// Sub-account index (0=main, 1-255=sub)
         account_index: u8,
+        /// 入金金额 (e6 normalized precision, 1 token = 1_000_000) — used for PDA balance update
+        amount_e6: i64,
     },
 
     /// Spot Token 出金 (用户直接调用)
@@ -475,10 +477,12 @@ pub enum VaultInstruction {
     SpotWithdraw {
         /// Token 索引
         token_index: u16,
-        /// 出金金额
+        /// 出金金额 (native precision) — used for SPL token transfer
         amount: u64,
         /// Sub-account index (0=main, 1-255=sub)
         account_index: u8,
+        /// 出金金额 (e6 normalized precision) — used for PDA balance check/deduction
+        amount_e6: i64,
     },
 
     /// Spot 锁定余额 (CPI only - 挂单时)
@@ -541,10 +545,12 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         /// Token 索引
         token_index: u16,
-        /// 入金金额
+        /// 入金金额 (native precision) — preserved for backward compat / logging
         amount: u64,
         /// Sub-account index (0=main, 1-255=sub)
         account_index: u8,
+        /// 入金金额 (e6 normalized precision) — used for PDA balance update
+        amount_e6: i64,
     },
 
     /// Relayer 代理 Spot 出金 (Admin/Relayer only)
@@ -558,10 +564,12 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         /// Token 索引
         token_index: u16,
-        /// 出金金额
+        /// 出金金额 (native precision) — used for SPL token transfer
         amount: u64,
         /// Sub-account index (0=main, 1-255=sub)
         account_index: u8,
+        /// 出金金额 (e6 normalized precision) — used for PDA balance check/deduction
+        amount_e6: i64,
     },
 
     // =========================================================================
