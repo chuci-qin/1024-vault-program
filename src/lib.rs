@@ -1,11 +1,8 @@
 //! 1024 DEX Vault Program
 //! 
-//! 完全去中心化的资金托管程序
-//! - 用户资金100%由链上程序托管
-//! - 入金/出金操作
-//! - 保证金锁定/释放
-//! - 保险基金管理
-//! - 清算结算
+//! User fund custody program (DB-First architecture).
+//! 18 active instructions for deposit/withdraw, Spot token management,
+//! on-chain state mirrors (UserAccount, SpotTokenBalance), and governance.
 
 use solana_program::{
     account_info::AccountInfo,
@@ -20,7 +17,6 @@ pub mod processor;
 pub mod state;
 pub mod token_compat;
 pub mod utils;
-pub mod cpi;
 
 #[cfg(not(feature = "no-entrypoint"))]
 entrypoint!(process_instruction);

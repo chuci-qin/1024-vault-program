@@ -1,785 +1,107 @@
 # 1024 Vault Program
 
-> 完全去中心化的资金托管程序 - 用户资金安全的核心保障
+User fund custody program for the 1024 DEX platform.
 
----
+## Architecture
 
-## 📋 目录
+**DB-First + On-chain Real-time Audit.** The Vault Program is one of only two active on-chain programs:
 
-- [概述](#概述)
-- [架构设计](#架构设计)
-- [账户结构](#账户结构)
-- [指令详解](#指令详解)
-- [PDA 地址推导](#pda-地址推导)
-- [CPI 集成指南](#cpi-集成指南)
-- [安全机制](#安全机制)
-- [构建与部署](#构建与部署)
-- [测试](#测试)
-- [错误代码](#错误代码)
+- **Vault Program** — Fund custody (deposit, withdraw, balance mirrors)
+- **Exchange Program** — Immutable audit records (trades, positions, liquidations)
 
----
+All trading logic executes in the backend database. The Vault Program handles:
 
-## 概述
+1. **Real SPL Token transfers** — User deposit/withdraw, Spot deposit/withdraw, Relayer-assisted cross-chain
+2. **On-chain state mirrors** — UserAccount and SpotTokenBalance PDAs reflect DB state (idempotent, set-to-value)
+3. **Governance operations** — Pause/resume, authorized caller management, authority transfer
 
-### 程序职责
+## Instructions (18 variants)
 
-1024 Vault Program 是 1024 DEX 生态系统的资金托管核心，负责：
+| Index | Instruction | Signer | Description |
+|:-----:|-------------|--------|-------------|
+| 0 | `Initialize` | Governance Authority | Create VaultConfig PDA |
+| 1 | `InitializeUser` | User | Create UserAccount PDA |
+| 2 | `Deposit` | User | USDC deposit (SPL Token transfer into Vault) |
+| 3 | `Withdraw` | User | USDC withdrawal (SPL Token transfer from Vault) |
+| 4 | `AddAuthorizedCaller` | Governance Authority | Add a program to the authorized callers list |
+| 5 | `RemoveAuthorizedCaller` | Governance Authority | Remove a program from the authorized callers list |
+| 6 | `SetPaused` | Governance Authority | Pause/resume the Vault |
+| 7 | `UpdateGovernanceAuthority` | Governance Authority | Transfer governance authority to a new key |
+| 8 | `RelayerDeposit` | Relayer | Relayer-assisted USDC deposit (auto-init UserAccount) |
+| 9 | `RelayerWithdraw` | Relayer | Relayer-assisted USDC withdrawal |
+| 10 | `SpotDeposit` | User | SPL Token deposit (wBTC/wETH/wSOL) into Vault |
+| 11 | `SpotWithdraw` | User | SPL Token withdrawal from Vault |
+| 12 | `RelayerSpotDeposit` | Relayer | Relayer-assisted Spot deposit (auto-init PDA) |
+| 13 | `RelayerSpotWithdraw` | Relayer | Relayer-assisted Spot withdrawal |
+| 14 | `RelayerWithdrawAndTransfer` | Relayer | Cross-chain bridge: debit UserAccount + transfer USDC to Relayer |
+| 15 | `UserAccount` | Relayer | Mirror UserAccount PDA to DB state (idempotent) |
+| 16 | `SpotTokenBalance` | Relayer | Mirror SpotTokenBalance PDA to DB state (idempotent) |
+| 17 | `MigrateVaultConfig` | Governance Authority | One-time V1 (569 bytes) to V2 (505 bytes) migration |
 
-| 职责 | 说明 |
-|------|------|
-| **资金托管** | 100% 链上托管，平台绝不接触用户私钥 |
-| **入金/出金** | 用户自主的 USDC 存取操作 |
-| **保证金管理** | 锁定/释放交易保证金 |
-| **清算结算** | 与 Ledger Program 配合的仓位清算 |
-| **预测市场资金** | 独立的预测市场用户账户 |
-| **跨链入金 (Relayer)** | 支持任意链资产无缝入金 |
+## PDA Seeds
 
-### 部署信息
+| Account | Seeds | Size |
+|---------|-------|:----:|
+| VaultConfig | `["vault_config"]` | 505 bytes |
+| UserAccount | `["user", wallet, &[account_index]]` | 153 bytes |
+| SpotTokenBalance | `["spot_balance", wallet, &[account_index], token_index.to_le_bytes()]` | 98 bytes |
 
-| 网络 | Program ID |
-|------|-----------|
-| 1024Chain Testnet | `vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny` |
-| 1024Chain Mainnet | TBD |
+## State Structs
 
-### 依赖关系
+### VaultConfig (505 bytes)
 
-```
-                    ┌─────────────────────┐
-                    │   1024-vault-program │
-                    │   (资金托管)          │
-                    └─────────┬───────────┘
-                              │
-        ┌─────────────────────┼─────────────────────┐
-        │                     │                     │
-        ▼                     ▼                     ▼
-┌───────────────┐   ┌─────────────────┐   ┌─────────────────┐
-│ Ledger Program│   │  Fund Program   │   │ Prediction      │
-│ (CPI 调用)     │   │ (保险基金)       │   │ Market Program  │
-└───────────────┘   └─────────────────┘   └─────────────────┘
-```
+Global program configuration. Stores governance authority, USDC mint, vault token account, and up to 10 authorized callers.
 
----
+### UserAccount (153 bytes)
 
-## 架构设计
+Per-user per-sub-account balance state. Fields: `available_balance_e6`, `locked_margin_e6`, `spot_locked_e6`, `oracle_locked_e6`, `unrealized_pnl_e6`, etc. `account_index=0` is the main account; 1-255 are sub-accounts.
 
-### 设计原则
+### SpotTokenBalance (98 bytes)
 
-```
-Vault Program = 用户资金托管 (用户的钱)
-Fund Program  = 资金池管理 (保险基金/手续费/返佣)
-```
+Per-token balance PDA. Each (wallet, account_index, token_index) triple gets its own PDA, auto-created on first use. Fields: `available_e6`, `locked_e6`.
 
-### 资金流向
+## Error Codes
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      资金流向示意图                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   用户钱包 (Solana/EVM)                                          │
-│       │                                                         │
-│       │  Deposit / RelayerDeposit                               │
-│       ▼                                                         │
-│   ┌─────────────────────────────────────┐                       │
-│   │         Vault Token Account          │                       │
-│   │   (存放所有用户的 USDC)               │                       │
-│   └─────────────────────┬───────────────┘                       │
-│                         │                                        │
-│         ┌───────────────┼───────────────┐                       │
-│         │               │               │                       │
-│         ▼               ▼               ▼                       │
-│   ┌───────────┐   ┌───────────┐   ┌───────────────────┐        │
-│   │UserAccount│   │UserAccount│   │PredictionMarket   │        │
-│   │  User A   │   │  User B   │   │UserAccount        │        │
-│   │           │   │           │   │                   │        │
-│   │ balance   │   │ balance   │   │ pm_locked         │        │
-│   │ locked    │   │ locked    │   │ pm_pending        │        │
-│   └───────────┘   └───────────┘   └───────────────────┘        │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Code | Name | Description |
+|:----:|------|-------------|
+| 0 | `InsufficientBalance` | Balance too low for operation |
+| 1 | `VaultPaused` | Vault is currently paused |
+| 2 | `InvalidAmount` | Amount is zero or invalid |
+| 3 | `InvalidAccount` | Account does not match expected |
+| 4 | `Overflow` | Numerical overflow |
+| 5 | `InvalidPda` | PDA derivation mismatch |
+| 6 | `AlreadyInitialized` | Account already initialized |
+| 7 | `NotInitialized` | Account not yet initialized |
+| 8 | `InvalidGovernanceAuthority` | Signer is not the governance authority |
+| 9 | `InvalidRelayer` | Signer is not an authorized relayer |
+| 10 | `UnauthorizedGovernanceAuthority` | Governance authority check failed |
+| 11 | `UnauthorizedUser` | User authorization check failed |
+| 12 | `QuoteAssetMustUseVaultPath` | USDC must use Deposit/Withdraw, not SpotDeposit/SpotWithdraw |
 
----
-
-## 🎯 一体化账户架构
-
-### 设计理念
-
-1024 DEX 采用**一体化账户架构**，交易所（永续合约）和预测市场**共享同一个入金 Vault**，用户只需管理一个账户即可在两个市场自由交易。
-
-### 为什么需要 PMUserAccount？
-
-> **核心问题**: 既然是一体化，为什么还要有独立的 `PMUserAccount` PDA？
-
-**答案**: `PMUserAccount` 不是"独立账户"，而是"锁定资金追踪器"。两个市场共享 `UserAccount.available_balance`，只是**锁定部分分开追踪**。
-
-### 架构图
+## Source Files
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Vault Program 一体化架构                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │                 UserAccount PDA (主账户 - 共享)                    │ │
-│  │  ┌───────────────────────────────────────────────────────────┐   │ │
-│  │  │ 💰 available_balance_e6   ← 入金/出金在这里                │   │ │
-│  │  │    (交易所 + 预测市场共享)                                 │   │ │
-│  │  └───────────────────────────────────────────────────────────┘   │ │
-│  │  ┌───────────────────────────────────────────────────────────┐   │ │
-│  │  │ 🔐 locked_margin_e6      ← 交易所锁定保证金                │   │ │
-│  │  │    (永续合约开仓)                                          │   │ │
-│  │  └───────────────────────────────────────────────────────────┘   │ │
-│  └───────────────────────────────────────────────────────────────────┘ │
-│                                    │                                    │
-│                     ┌──────────────┴──────────────┐                    │
-│                     │      available_balance      │                    │
-│                     │         可自由分配           │                    │
-│                     └──────────────┬──────────────┘                    │
-│                                    │                                    │
-│            ┌───────────────────────┼───────────────────────┐           │
-│            │                       │                       │           │
-│            ▼                       │                       ▼           │
-│   ┌─────────────────┐              │              ┌─────────────────┐  │
-│   │ 交易所下单       │              │              │ 预测市场下单     │  │
-│   │ (永续合约)       │              │              │ (CTF 市场)      │  │
-│   │                 │              │              │                 │  │
-│   │ → locked_margin │              │              │ → pm_locked     │  │
-│   │   (在 UserAccount)             │              │   (在 PMUserAccount)│
-│   └─────────────────┘              │              └─────────────────┘  │
-│                                    │                                    │
-│  ┌───────────────────────────────────────────────────────────────────┐ │
-│  │              PMUserAccount PDA (预测市场锁定追踪器)                │ │
-│  │  ┌───────────────────────────────────────────────────────────┐   │ │
-│  │  │ 🔒 pm_locked_e6           ← 预测市场锁定（挂单保证金）     │   │ │
-│  │  └───────────────────────────────────────────────────────────┘   │ │
-│  │  ┌───────────────────────────────────────────────────────────┐   │ │
-│  │  │ 📤 pm_pending_settlement_e6  ← 待结算收益（市场结算后）    │   │ │
-│  │  └───────────────────────────────────────────────────────────┘   │ │
-│  └───────────────────────────────────────────────────────────────────┘ │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+src/
+  lib.rs           — Entrypoint
+  instruction.rs   — VaultInstruction enum (18 variants)
+  processor.rs     — Instruction dispatch and handlers
+  state.rs         — VaultConfig, UserAccount, SpotTokenBalance
+  error.rs         — VaultError enum (13 variants)
+  utils.rs         — Signer/writable assertions, checked arithmetic
+  token_compat.rs  — SPL Token transfer helpers
 ```
 
-### 资金流向示例
-
-```
-用户入金 $1000:
-  └→ UserAccount.available_balance = $1000
-
-交易所开仓 $300 保证金:
-  ├→ UserAccount.available_balance = $700  (扣除)
-  └→ UserAccount.locked_margin = $300      (锁定)
-
-预测市场下单 $200:
-  ├→ UserAccount.available_balance = $500  (继续扣除)
-  └→ PMUserAccount.pm_locked = $200        (预测市场锁定)
-
-剩余可用: $500 (可在两个市场继续使用)
-
-预测市场取消订单:
-  ├→ PMUserAccount.pm_locked = $0
-  └→ UserAccount.available_balance = $700  (返还)
-```
-
-### 为什么分开追踪？
-
-| 原因 | 交易所 | 预测市场 |
-|------|--------|---------|
-| **风险模型** | 杠杆交易，需要维持保证金率，可能爆仓 | 无杠杆，不存在爆仓 |
-| **结算机制** | 盈亏实时结算到 available_balance | 市场结束后才能结算，有 pending_settlement |
-| **锁定目的** | 防止亏损超过保证金 | 确保订单有足够抵押 |
-
-### 用户视角（前端显示）
-
-```
-┌────────────────────────────────────────────────────────┐
-│ 💼 Account Overview                                    │
-├────────────────────────────────────────────────────────┤
-│ 💰 Total Balance:     $1,000.00                        │
-│ ─────────────────────────────────────────────────────  │
-│ 🟢 Available:         $500.00                          │
-│ 🔐 Locked (Perp):     $300.00  ← locked_margin         │
-│ 🔒 Locked (PM):       $200.00  ← pm_locked             │
-└────────────────────────────────────────────────────────┘
-```
-
-**用户感知不到有两个账户**，他们只看到一个统一的资金面板。
-
-### 一体化需求满足情况
-
-| 需求 | 满足 | 说明 |
-|------|------|------|
-| 共用一个入金 Vault | ✅ | 用户只入金到 UserAccount |
-| 共用 available_balance | ✅ | 两个市场从同一余额扣款 |
-| 一个账户两个市场下单 | ✅ | 同一笔资金可同时使用 |
-| 用户只需管理一个账户 | ✅ | 只需一次入金 |
-
----
-
-## 账户结构
-
-### 1. VaultConfig (全局配置)
-
-**PDA Seeds:** `["vault_config"]`
-
-**大小:** ~400 bytes
-
-```rust
-pub struct VaultConfig {
-    pub discriminator: u64,              // 账户类型标识 "VAULT_CO"
-    pub admin: Pubkey,                   // 管理员
-    pub usdc_mint: Pubkey,               // USDC Mint 地址
-    pub vault_token_account: Pubkey,     // Vault USDC 存储账户
-    pub authorized_callers: Vec<Pubkey>, // CPI 授权白名单 (最多10个)
-    pub ledger_program: Pubkey,          // Ledger Program ID
-    pub fund_program: Option<Pubkey>,    // Fund Program ID
-    pub delegation_program: Pubkey,      // Delegation Program ID
-    pub total_deposits: u64,             // 总存款 (e6)
-    pub total_locked: u64,               // 总锁定保证金 (e6)
-    pub is_paused: bool,                 // 暂停状态
-}
-```
-
-### 2. UserAccount (用户账户)
-
-**PDA Seeds:** `["user", wallet_pubkey]`
-
-**大小:** 153 bytes
-
-```rust
-pub struct UserAccount {
-    pub discriminator: u64,          // 账户类型标识 "USER_ACC"
-    pub wallet: Pubkey,              // 用户钱包地址
-    pub bump: u8,                    // PDA bump
-    pub available_balance_e6: i64,   // 可用余额 (e6)
-    pub locked_margin_e6: i64,       // 锁定保证金 (e6)
-    pub unrealized_pnl_e6: i64,      // 未实现盈亏 (e6)
-    pub total_deposited_e6: i64,     // 累计存款 (e6)
-    pub total_withdrawn_e6: i64,     // 累计提款 (e6)
-    pub last_update_ts: i64,         // 最后更新时间
-    pub reserved: [u8; 64],          // 预留扩展
-}
-```
-
-**关键方法:**
-
-```rust
-impl UserAccount {
-    /// 计算用户权益 (可用 + 锁定 + 未实现盈亏)
-    pub fn equity(&self) -> i64 {
-        self.available_balance_e6 + self.locked_margin_e6 + self.unrealized_pnl_e6
-    }
-}
-```
-
-### 3. PredictionMarketUserAccount (预测市场用户账户)
-
-**PDA Seeds:** `["prediction_market_user", wallet_pubkey]`
-
-**大小:** 161 bytes
-
-```rust
-pub struct PredictionMarketUserAccount {
-    pub discriminator: u64,                      // "PM_USER"
-    pub wallet: Pubkey,                          // 用户钱包
-    pub bump: u8,                                // PDA bump
-    pub prediction_market_locked_e6: i64,        // 预测市场锁定资金
-    pub prediction_market_pending_settlement_e6: i64, // 待结算收益
-    pub prediction_market_total_deposited_e6: i64,    // 累计存入
-    pub prediction_market_total_withdrawn_e6: i64,    // 累计提取
-    pub prediction_market_realized_pnl_e6: i64,       // 已实现盈亏
-    pub last_update_ts: i64,                     // 最后更新
-    pub reserved: [u8; 64],                      // 预留
-}
-```
-
----
-
-## 指令详解
-
-### 用户操作指令
-
-#### 1. InitializeUser
-
-初始化用户账户 PDA。
-
-```rust
-InitializeUser
-```
-
-| 账户 | 类型 | 说明 |
-|------|------|------|
-| 0 | `[signer]` | 用户钱包 |
-| 1 | `[writable]` | UserAccount PDA |
-| 2 | `[]` | System Program |
-
-**示例 (TypeScript):**
-
-```typescript
-const [userAccountPDA] = await PublicKey.findProgramAddress(
-    [Buffer.from("user"), wallet.publicKey.toBuffer()],
-    VAULT_PROGRAM_ID
-);
-
-const ix = new TransactionInstruction({
-    keys: [
-        { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
-        { pubkey: userAccountPDA, isSigner: false, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-    ],
-    programId: VAULT_PROGRAM_ID,
-    data: Buffer.from([1]), // InitializeUser instruction index
-});
-```
-
-#### 2. Deposit
-
-用户存入 USDC。
-
-```rust
-Deposit { amount: u64 }
-```
-
-| 账户 | 类型 | 说明 |
-|------|------|------|
-| 0 | `[signer]` | 用户钱包 |
-| 1 | `[writable]` | UserAccount PDA |
-| 2 | `[writable]` | 用户 USDC Token Account |
-| 3 | `[writable]` | Vault USDC Token Account |
-| 4 | `[writable]` | VaultConfig |
-| 5 | `[]` | Token Program |
-
-#### 3. Withdraw
-
-用户提取 USDC。
-
-```rust
-Withdraw { amount: u64 }
-```
-
-| 账户 | 类型 | 说明 |
-|------|------|------|
-| 0 | `[signer]` | 用户钱包 |
-| 1 | `[writable]` | UserAccount PDA |
-| 2 | `[writable]` | 用户 USDC Token Account |
-| 3 | `[writable]` | Vault USDC Token Account |
-| 4 | `[]` | VaultConfig |
-| 5 | `[]` | Token Program |
-
-### CPI 操作指令
-
-> ⚠️ 这些指令只能由白名单中的 Program 通过 CPI 调用
-
-#### 4. LockMargin
-
-锁定用户保证金（开仓时）。
-
-```rust
-LockMargin { amount: u64 }
-```
-
-| 账户 | 类型 | 说明 |
-|------|------|------|
-| 0 | `[]` | VaultConfig |
-| 1 | `[writable]` | UserAccount |
-| 2 | `[]` | Caller Program (验证白名单) |
-
-#### 5. ReleaseMargin
-
-释放用户保证金（平仓时）。
-
-```rust
-ReleaseMargin { amount: u64 }
-```
-
-#### 6. ClosePositionSettle
-
-平仓结算（合并操作）。
-
-```rust
-ClosePositionSettle {
-    margin_to_release: u64,  // 释放的保证金
-    realized_pnl: i64,       // 实现盈亏 (+/-) 
-    fee: u64,                // 手续费
-}
-```
-
-#### 7. LiquidatePosition
-
-清算仓位。
-
-```rust
-LiquidatePosition {
-    margin: u64,             // 用户锁定的保证金
-    user_remainder: u64,     // 返还给用户的剩余
-    liquidation_penalty: u64, // 清算罚金 → Insurance Fund
-}
-```
-
-### 预测市场指令
-
-#### 8. InitializePredictionMarketUser
-
-创建预测市场用户账户。
-
-#### 9. PredictionMarketLock
-
-从 UserAccount 锁定资金到预测市场。
-
-```rust
-PredictionMarketLock { amount: u64 }
-```
-
-#### 10. PredictionMarketUnlock
-
-从预测市场释放资金回 UserAccount。
-
-#### 11. PredictionMarketSettle
-
-预测市场结算。
-
-```rust
-PredictionMarketSettle {
-    locked_amount: u64,      // 原锁定金额
-    settlement_amount: u64,  // 结算应得金额
-}
-```
-
-#### 12. PredictionMarketClaimSettlement
-
-用户领取预测市场结算收益。
-
-### Relayer 指令
-
-> 用于跨链入金场景，用户无需在 1024Chain 上签名
-
-#### 13. RelayerDeposit
-
-Relayer 代理入金。
-
-```rust
-RelayerDeposit {
-    user_wallet: Pubkey,  // 目标用户
-    amount: u64,          // 入金金额
-}
-```
-
-**特性:**
-- 如果 UserAccount 不存在，自动创建
-- 仅 Admin 可调用
-- 不涉及实际 Token 转账（余额凭证模式）
-
-#### 14. RelayerWithdraw
-
-Relayer 代理出金。
-
-```rust
-RelayerWithdraw {
-    user_wallet: Pubkey,
-    amount: u64,
-}
-```
-
-### 管理员指令
-
-| 指令 | 说明 |
-|------|------|
-| `Initialize` | 初始化 Vault 配置 |
-| `AddAuthorizedCaller` | 添加 CPI 白名单 |
-| `RemoveAuthorizedCaller` | 移除 CPI 白名单 |
-| `SetPaused` | 暂停/恢复程序 |
-| `UpdateAdmin` | 更新管理员 |
-| `SetFundProgram` | 设置 Fund Program |
-| `AdminForceReleaseMargin` | 强制释放用户保证金 |
-| `AdminPredictionMarketForceUnlock` | 强制释放预测市场锁定 |
-
----
-
-## PDA 地址推导
-
-### TypeScript 示例
-
-```typescript
-import { PublicKey } from '@solana/web3.js';
-
-const VAULT_PROGRAM_ID = new PublicKey('vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny');
-
-// VaultConfig PDA
-const [vaultConfigPDA] = await PublicKey.findProgramAddress(
-    [Buffer.from("vault_config")],
-    VAULT_PROGRAM_ID
-);
-
-// UserAccount PDA
-const [userAccountPDA] = await PublicKey.findProgramAddress(
-    [Buffer.from("user"), userWallet.toBuffer()],
-    VAULT_PROGRAM_ID
-);
-
-// PredictionMarketUserAccount PDA
-const [pmUserAccountPDA] = await PublicKey.findProgramAddress(
-    [Buffer.from("prediction_market_user"), userWallet.toBuffer()],
-    VAULT_PROGRAM_ID
-);
-```
-
-### Rust 示例
-
-```rust
-use solana_program::pubkey::Pubkey;
-
-let (vault_config_pda, _bump) = Pubkey::find_program_address(
-    &[b"vault_config"],
-    &program_id,
-);
-
-let (user_account_pda, _bump) = Pubkey::find_program_address(
-    &[b"user", user_wallet.as_ref()],
-    &program_id,
-);
-```
-
----
-
-## CPI 集成指南
-
-### 从 Ledger Program 调用 LockMargin
-
-```rust
-use solana_program::program::invoke;
-
-// 构建 CPI 调用
-let lock_margin_ix = VaultInstruction::LockMargin { 
-    amount: margin_amount 
-};
-
-invoke(
-    &Instruction {
-        program_id: vault_program_id,
-        accounts: vec![
-            AccountMeta::new_readonly(vault_config.key(), false),
-            AccountMeta::new(user_account.key(), false),
-            AccountMeta::new_readonly(*program_id, false), // 调用方 Program
-        ],
-        data: lock_margin_ix.try_to_vec()?,
-    },
-    &[vault_config, user_account],
-)?;
-```
-
-### 验证调用方
-
-Vault Program 内部验证:
-
-```rust
-fn verify_cpi_caller(
-    config: &VaultConfig, 
-    caller_program: &Pubkey
-) -> Result<(), VaultError> {
-    if config.is_authorized_caller(caller_program) {
-        Ok(())
-    } else {
-        Err(VaultError::UnauthorizedCaller)
-    }
-}
-```
-
-### ⚠️ 重要：Prediction Market CPI 授权
-
-**添加到 `authorized_callers` 的应该是 PM Config PDA，而不是 PM Program ID！**
-
-```typescript
-// ✅ 正确 - 添加 PM Config PDA
-const PM_CONFIG_PDA = "BLPdJuvYHzUf1mcNTEBQHHt1SzD3LxTgsNqQe5tCeD1k";
-
-// ❌ 错误 - PM Program ID 不是 CPI caller
-const PM_PROGRAM_ID = "FVtPQkdYvSNdpTA6QXYRcTBhDGgnufw2Enqmo2tQKr58";
-```
-
-**原因**: PM Program 通过 `invoke_signed` 使用 PM Config PDA 作为签名者调用 Vault CPI：
-
-```rust
-// PM Program 的 CPI 调用
-cpi_lock_for_prediction(
-    vault_program,
-    vault_config,
-    user_account,
-    pm_user_account,
-    config_info,      // ← PM Config PDA，这是 CPI caller
-    amount,
-    &[PM_CONFIG_SEED, &[config_bump]], // PDA 签名
-)?;
-```
-
-### 添加 PM Config PDA 到白名单
+## Build
 
 ```bash
-cd onchain-program/scripts
-npx ts-node add-pm-to-vault-whitelist.ts
-```
-
-或手动调用 `AddAuthorizedCaller` 指令：
-
-```typescript
-const data = Buffer.alloc(1 + 32);
-data.writeUInt8(8, 0); // AddAuthorizedCaller instruction index
-PM_CONFIG_PDA.toBuffer().copy(data, 1);
-
-const ix = new TransactionInstruction({
-    programId: VAULT_PROGRAM_ID,
-    keys: [
-        { pubkey: admin, isSigner: true, isWritable: false },
-        { pubkey: vaultConfig, isSigner: false, isWritable: true },
-    ],
-    data,
-});
-```
-
----
-
-## 安全机制
-
-### 1. CPI 白名单验证
-
-所有 CPI 指令都会验证调用方是否在白名单中：
-
-```rust
-if !vault_config.is_authorized_caller(caller_program.key) {
-    return Err(VaultError::UnauthorizedCaller);
-}
-```
-
-### 2. 余额安全
-
-- 使用 `i64` 类型支持负数（未实现亏损）
-- 所有运算使用 `checked_` 方法防止溢出
-- 提款前验证可用余额充足
-
-### 3. 暂停机制
-
-- Admin 可随时暂停程序
-- 暂停状态下禁止所有用户操作
-- 紧急情况下的保护措施
-
-### 4. Relayer 安全
-
-- 仅 Admin 可执行 Relayer 操作
-- 跨链消息由后端验证
-- 出金需确保链下资金到位
-
----
-
-## 构建与部署
-
-### 构建
-
-```bash
-cd 1024-vault-program
-
-# 编译检查
-cargo check
-
-# 运行测试
-cargo test --lib
-
-# 构建 BPF 程序
 cargo build-sbf
+# Output: target/deploy/vault_program.so
 ```
 
-### 部署
+## Program IDs
 
-```bash
-# 部署到 1024Chain Testnet
-solana program deploy target/deploy/vault_program.so \
-    --url https://testnet-rpc.1024chain.com/rpc/ \
-    --program-id vR3BifKCa2TGKP2uhToxZAMYAYydqpesvKGX54gzFny \
-    --use-rpc
-```
-
----
-
-## 测试
-
-### 单元测试覆盖
-
-| 测试项 | 文件 | 状态 |
-|--------|------|------|
-| UserAccount equity 计算 | `state.rs` | ✅ |
-| VaultConfig authorized_caller | `state.rs` | ✅ |
-| PredictionMarketUserAccount 锁定/释放 | `state.rs` | ✅ |
-| 预测市场结算盈亏计算 | `state.rs` | ✅ |
-| 安全数学运算 | `utils.rs` | ✅ |
-
-### 运行测试
-
-```bash
-cargo test --lib
-
-# 输出:
-# running 6 tests
-# test state::tests::test_user_account_equity ... ok
-# test state::tests::test_vault_config_authorized_caller ... ok
-# test state::tests::test_prediction_market_user_account_creation ... ok
-# test state::tests::test_prediction_market_lock_unlock ... ok
-# test state::tests::test_prediction_market_settle ... ok
-# test state::tests::test_prediction_market_settle_with_profit ... ok
-```
-
----
-
-## 错误代码
-
-| 错误 | Code | 说明 |
-|------|------|------|
-| `InsufficientBalance` | 0 | 余额不足 |
-| `InvalidAmount` | 1 | 无效金额 |
-| `UnauthorizedCaller` | 2 | 未授权的 CPI 调用方 |
-| `VaultPaused` | 3 | Vault 已暂停 |
-| `Overflow` | 4 | 数值溢出 |
-| `Underflow` | 5 | 数值下溢 |
-| `InvalidPDA` | 6 | 无效的 PDA 地址 |
-| `InvalidAdmin` | 7 | 非管理员调用 |
-| `AccountNotInitialized` | 8 | 账户未初始化 |
-| `InvalidMint` | 9 | 无效的 Mint 地址 |
-
----
-
-## 文件结构
-
-```
-1024-vault-program/
-├── Cargo.toml
-├── README.md
-├── rust-toolchain.toml
-└── src/
-    ├── lib.rs          # 程序入口点
-    ├── state.rs        # 账户结构定义
-    ├── instruction.rs  # 指令枚举定义
-    ├── processor.rs    # 指令处理逻辑
-    ├── error.rs        # 错误类型
-    ├── utils.rs        # 工具函数
-    └── cpi.rs          # CPI Helper 函数
-```
-
----
-
-## License
-
-MIT
-
----
-
-*Last Updated: 2025-12-17*
-
----
-
-## 更新日志
-
-### 2025-12-17
-- 添加"一体化账户架构"章节，详细说明交易所和预测市场共享账户的设计理念
-- 添加 PM Config PDA 授权说明，强调 CPI caller 是 PDA 而非 Program ID
-- 更新 CPI 集成指南
-
-### 2025-12-09
-- 初始版本
+| Environment | Program ID |
+|-------------|-----------|
+| Local Testnet | `EKsHPHtZmHRH9TFNGPVFp7MWNFuBcYZj1mdv87F9aSNt` |
+| Testnet-Stable | `BxMAToJxZYZ2iTrFL4cRAVL9pHZyakMvjbk1LTLHi9Nh` |
+| Mainnet | `C3pDwbciRtrxDr2Qfuqw67EUb9DHBJsAnmhty1jfk9fF` |
