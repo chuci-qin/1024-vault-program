@@ -1,0 +1,269 @@
+{
+  "version": "0.1.0",
+  "name": "1024_vault",
+  "instructions": [
+    {
+      "name": "initialize",
+      "discriminator": [0],
+      "accounts": [
+        { "name": "governanceAuthority", "isMut": true, "isSigner": true },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false },
+        { "name": "usdcMint", "isMut": false, "isSigner": false },
+        { "name": "vaultTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false },
+        { "name": "rent", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "delegationProgram", "type": "publicKey" }
+      ]
+    },
+    {
+      "name": "initializeUser",
+      "discriminator": [1],
+      "accounts": [
+        { "name": "user", "isMut": false, "isSigner": true },
+        { "name": "userAccount", "isMut": true, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "accountIndex", "type": "u8" }
+      ]
+    },
+    {
+      "name": "deposit",
+      "discriminator": [2],
+      "accounts": [
+        { "name": "user", "isMut": false, "isSigner": true },
+        { "name": "userAccount", "isMut": true, "isSigner": false },
+        { "name": "userTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "amount", "type": "u64" }
+      ]
+    },
+    {
+      "name": "withdraw",
+      "discriminator": [3],
+      "accounts": [
+        { "name": "user", "isMut": false, "isSigner": true },
+        { "name": "userAccount", "isMut": true, "isSigner": false },
+        { "name": "userTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "amount", "type": "u64" }
+      ]
+    },
+    {
+      "name": "addAuthorizedCaller",
+      "discriminator": [4],
+      "accounts": [
+        { "name": "governanceAuthority", "isMut": false, "isSigner": true },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false }
+      ],
+      "args": [
+        { "name": "caller", "type": "publicKey" }
+      ]
+    },
+    {
+      "name": "removeAuthorizedCaller",
+      "discriminator": [5],
+      "accounts": [
+        { "name": "governanceAuthority", "isMut": false, "isSigner": true },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false }
+      ],
+      "args": [
+        { "name": "caller", "type": "publicKey" }
+      ]
+    },
+    {
+      "name": "setPaused",
+      "discriminator": [6],
+      "accounts": [
+        { "name": "governanceAuthority", "isMut": false, "isSigner": true },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false }
+      ],
+      "args": [
+        { "name": "paused", "type": "bool" }
+      ]
+    },
+    {
+      "name": "updateGovernanceAuthority",
+      "discriminator": [7],
+      "accounts": [
+        { "name": "governanceAuthority", "isMut": false, "isSigner": true },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false }
+      ],
+      "args": [
+        { "name": "newGovernanceAuthority", "type": "publicKey" }
+      ]
+    },
+    {
+      "name": "relayerDeposit",
+      "discriminator": [8],
+      "accounts": [
+        { "name": "relayer", "isMut": false, "isSigner": true },
+        { "name": "userAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "userWallet", "type": "publicKey" },
+        { "name": "amount", "type": "u64" },
+        { "name": "accountIndex", "type": "u8" }
+      ]
+    },
+    {
+      "name": "relayerWithdraw",
+      "discriminator": [9],
+      "accounts": [
+        { "name": "relayer", "isMut": false, "isSigner": true },
+        { "name": "userAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "userWallet", "type": "publicKey" },
+        { "name": "amount", "type": "u64" },
+        { "name": "accountIndex", "type": "u8" }
+      ]
+    },
+    {
+      "name": "spotDeposit",
+      "discriminator": [10],
+      "accounts": [
+        { "name": "user", "isMut": false, "isSigner": true },
+        { "name": "spotTokenBalance", "isMut": true, "isSigner": false },
+        { "name": "userTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "tokenIndex", "type": "u16" },
+        { "name": "amount", "type": "u64" },
+        { "name": "accountIndex", "type": "u8" },
+        { "name": "amountE6", "type": "i64" }
+      ]
+    },
+    {
+      "name": "spotWithdraw",
+      "discriminator": [11],
+      "accounts": [
+        { "name": "user", "isMut": false, "isSigner": true },
+        { "name": "spotTokenBalance", "isMut": true, "isSigner": false },
+        { "name": "userTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "tokenIndex", "type": "u16" },
+        { "name": "amount", "type": "u64" },
+        { "name": "accountIndex", "type": "u8" },
+        { "name": "amountE6", "type": "i64" }
+      ]
+    },
+    {
+      "name": "relayerSpotDeposit",
+      "discriminator": [12],
+      "accounts": [
+        { "name": "relayer", "isMut": false, "isSigner": true },
+        { "name": "spotTokenBalance", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "userWallet", "type": "publicKey" },
+        { "name": "tokenIndex", "type": "u16" },
+        { "name": "amount", "type": "u64" },
+        { "name": "accountIndex", "type": "u8" },
+        { "name": "amountE6", "type": "i64" }
+      ]
+    },
+    {
+      "name": "relayerSpotWithdraw",
+      "discriminator": [13],
+      "accounts": [
+        { "name": "relayer", "isMut": false, "isSigner": true },
+        { "name": "spotTokenBalance", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "userWallet", "type": "publicKey" },
+        { "name": "tokenIndex", "type": "u16" },
+        { "name": "amount", "type": "u64" },
+        { "name": "accountIndex", "type": "u8" },
+        { "name": "amountE6", "type": "i64" }
+      ]
+    },
+    {
+      "name": "relayerWithdrawAndTransfer",
+      "discriminator": [14],
+      "accounts": [
+        { "name": "relayer", "isMut": false, "isSigner": true },
+        { "name": "userAccount", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false },
+        { "name": "vaultTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "relayerTokenAccount", "isMut": true, "isSigner": false },
+        { "name": "tokenProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "userWallet", "type": "publicKey" },
+        { "name": "amount", "type": "u64" },
+        { "name": "accountIndex", "type": "u8" }
+      ]
+    },
+    {
+      "name": "userAccount",
+      "discriminator": [15],
+      "accounts": [
+        { "name": "relayer", "isMut": false, "isSigner": true },
+        { "name": "userAccountPda", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "userWallet", "type": "publicKey" },
+        { "name": "accountIndex", "type": "u8" },
+        { "name": "availableBalanceE6", "type": "i64" },
+        { "name": "lockedMarginE6", "type": "i64" },
+        { "name": "spotLockedE6", "type": "i64" },
+        { "name": "oracleLockedE6", "type": "i64" }
+      ]
+    },
+    {
+      "name": "spotTokenBalance",
+      "discriminator": [16],
+      "accounts": [
+        { "name": "relayer", "isMut": false, "isSigner": true },
+        { "name": "spotTokenBalancePda", "isMut": true, "isSigner": false },
+        { "name": "vaultConfig", "isMut": false, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": [
+        { "name": "userWallet", "type": "publicKey" },
+        { "name": "accountIndex", "type": "u8" },
+        { "name": "tokenIndex", "type": "u16" },
+        { "name": "availableE6", "type": "i64" },
+        { "name": "lockedE6", "type": "i64" }
+      ]
+    },
+    {
+      "name": "migrateVaultConfig",
+      "discriminator": [17],
+      "accounts": [
+        { "name": "governanceAuthority", "isMut": false, "isSigner": true },
+        { "name": "vaultConfig", "isMut": true, "isSigner": false },
+        { "name": "systemProgram", "isMut": false, "isSigner": false }
+      ],
+      "args": []
+    }
+  ]
+}

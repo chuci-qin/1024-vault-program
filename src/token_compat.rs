@@ -140,6 +140,10 @@ pub fn create_transfer_instruction(
 /// `transfer_checked` instead.  Current Deposit/Withdraw paths use USDC
 /// (Token v1) where Transfer is safe, but SpotDeposit/SpotWithdraw should
 /// migrate to `transfer_checked` when adding Token-2022 asset support.
+///
+/// OC-M6: Migration to `transfer_checked` requires adding mint account to each
+/// instruction's accounts list. Deferred until Token-2022 support is implemented.
+#[deprecated(note = "OC-M6: Use transfer_checked with mint account for Token-2022 compatibility")]
 pub fn transfer<'a>(
     token_program: &AccountInfo<'a>,
     source: &AccountInfo<'a>,

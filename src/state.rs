@@ -89,11 +89,37 @@ pub const VAULT_CONFIG_SIZE_V1: usize = 569;
 impl VaultConfig {
     pub const DISCRIMINATOR: u64 = 0x5641554C545F434F; // "VAULT_CO"
     
-    /// Verify caller is authorized via the authorized_callers array.
+    /// OC-H2: Check if a caller is in the authorized_callers list.
+    /// Used by relayer instructions alongside governance_authority check.
     pub fn is_authorized_caller(&self, caller: &Pubkey) -> bool {
         for authorized in &self.authorized_callers {
             if authorized != &Pubkey::default() && caller == authorized {
                 return true;
+            }
+        }
+        false
+    }
+
+    /// OC-H2: Check if a signer is the governance_authority OR an authorized caller.
+    /// Works on raw VaultConfig bytes without full deserialization.
+    /// Layout: discriminator(8) + governance_authority(32) + usdc_mint(32) +
+    ///         vault_token_account(32) + authorized_callers(32*10=320)
+    pub fn is_valid_relayer_from_bytes(data: &[u8], signer: &Pubkey) -> bool {
+        if data.len() < 424 {
+            return false;
+        }
+        if let Ok(governance) = Pubkey::try_from(&data[8..40]) {
+            if &governance == signer {
+                return true;
+            }
+        }
+        for i in 0..10 {
+            let start = 104 + i * 32;
+            let end = start + 32;
+            if let Ok(caller) = Pubkey::try_from(&data[start..end]) {
+                if caller != Pubkey::default() && &caller == signer {
+                    return true;
+                }
             }
         }
         false
@@ -291,6 +317,10 @@ impl SpotTokenBalance {
 /// Seeds: ["spot_balance", wallet, account_index, token_index.to_le_bytes()]
 /// account_index ensures sub-accounts have isolated Spot balances.
 /// Returns (pda_address, bump)
+#[deprecated(
+    since = "OC-H4",
+    note = "Hardcodes account_index=0. Use derive_spot_token_balance_pda_with_index() instead."
+)]
 pub fn derive_spot_token_balance_pda(
     program_id: &Pubkey,
     wallet: &Pubkey,

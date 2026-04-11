@@ -44,6 +44,20 @@ fn deserialize_account<T: BorshDeserialize>(data: &[u8]) -> Result<T, std::io::E
     T::deserialize(&mut slice)
 }
 
+/// OC-M2: Deserialize + discriminator check for Vault PDA accounts.
+/// All Vault structs have `discriminator: u64` as the first 8 bytes.
+fn deserialize_checked(data: &[u8], expected_discriminator: u64) -> Result<(), ProgramError> {
+    if data.len() < 8 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    let disc = u64::from_le_bytes(data[..8].try_into().map_err(|_| ProgramError::InvalidAccountData)?);
+    if disc != expected_discriminator {
+        msg!("❌ Discriminator mismatch: expected 0x{:016X}, got 0x{:016X}", expected_discriminator, disc);
+        return Err(ProgramError::InvalidAccountData);
+    }
+    Ok(())
+}
+
 /// Program state handler
 pub struct Processor;
 
@@ -294,6 +308,21 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
+        // OC-H1: Verify user token account mint matches VaultConfig.usdc_mint
+        {
+            let user_ta_data = user_token_account.data.borrow();
+            if user_ta_data.len() < 40 {
+                msg!("❌ User token account data too short ({} bytes), expected >= 40", user_ta_data.len());
+                return Err(VaultError::InvalidAccount.into());
+            }
+            let mint_bytes: [u8; 32] = user_ta_data[..32].try_into().unwrap_or([0u8; 32]);
+            let user_mint = Pubkey::new_from_array(mint_bytes);
+            if user_mint != vault_config.usdc_mint {
+                msg!("❌ User token account mint mismatch: expected {}, got {}", vault_config.usdc_mint, user_mint);
+                return Err(VaultError::InvalidAccount.into());
+            }
+        }
+
         // V-1: Verify UserAccount PDA
         let user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
         let (expected_user_pda, _) = UserAccount::derive_pda(program_id, user.key, user_account.account_index);
@@ -370,7 +399,23 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
-        // V-1: Verify UserAccount PDA
+        // OC-H1: Verify user token account mint matches VaultConfig.usdc_mint
+        {
+            let user_ta_data = user_token_account.data.borrow();
+            if user_ta_data.len() < 40 {
+                msg!("❌ Withdraw: user token account data too short ({} bytes), expected >= 40", user_ta_data.len());
+                return Err(VaultError::InvalidAccount.into());
+            }
+            let mint_bytes: [u8; 32] = user_ta_data[..32].try_into().unwrap_or([0u8; 32]);
+            let user_mint = Pubkey::new_from_array(mint_bytes);
+            if user_mint != vault_config.usdc_mint {
+                msg!("❌ Withdraw: user token account mint mismatch: expected {}, got {}", vault_config.usdc_mint, user_mint);
+                return Err(VaultError::InvalidAccount.into());
+            }
+        }
+
+        // V-1: Verify UserAccount PDA + OC-M2 discriminator
+        deserialize_checked(&user_account_info.data.borrow(), UserAccount::DISCRIMINATOR)?;
         let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
         let (expected_user_pda, _) = UserAccount::derive_pda(program_id, user.key, user_account.account_index);
         if user_account_info.key != &expected_user_pda {
@@ -475,7 +520,8 @@ impl Processor {
             vault_config.serialize(&mut &mut vault_config_info.data.borrow_mut()[..])?;
             msg!("Removed authorized caller: {}", caller);
         } else {
-            msg!("Caller not found in authorized list: {}", caller);
+            msg!("❌ Caller not found in authorized list: {}", caller);
+            return Err(VaultError::UnauthorizedUser.into());
         }
 
         Ok(())
@@ -534,6 +580,11 @@ impl Processor {
     /// 3. 增加用户余额
     /// 
     /// 测试网特性：Governance Authority 可自由给任何用户入金（凭证模式）
+    /// OC-L5: RelayerDeposit intentionally skips `is_paused` check.
+    /// Rationale: When the vault is paused (e.g. during incident response), cross-chain bridge
+    /// deposits must still be processed to avoid stuck user funds on the source chain.
+    /// The pause only affects user-initiated Deposit/Withdraw (which require user signature).
+    /// Relayer operations (governed by governance_authority) bypass pause by design.
     fn process_relayer_deposit(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
@@ -552,24 +603,12 @@ impl Processor {
         assert_writable(user_account_info)?;
         // VaultConfig 不需要写入 (不更新 total_deposits)
 
-        // 2. 验证 governance authority 权限
-        // 兼容旧版 VaultConfig：直接读取 governance_authority 字段 (offset 8, 32 bytes)
+        // OC-H2: Verify signer is governance_authority or authorized_caller
         let vault_config_data = vault_config_info.data.borrow();
-        if vault_config_data.len() < 40 {
-            msg!("❌ Invalid VaultConfig data length: {}", vault_config_data.len());
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        // VaultConfig 结构: discriminator (8) + governance_authority (32) + ...
-        let stored_governance_authority = Pubkey::try_from(&vault_config_data[8..40])
-            .map_err(|_| VaultError::InvalidAccount)?;
-        
-        if stored_governance_authority != *governance_authority.key {
-            msg!("❌ Invalid relayer: {} (expected governance_authority: {})", governance_authority.key, stored_governance_authority);
+        if !VaultConfig::is_valid_relayer_from_bytes(&vault_config_data, governance_authority.key) {
+            msg!("❌ Invalid relayer: {} (not governance_authority nor authorized_caller)", governance_authority.key);
             return Err(VaultError::InvalidRelayer.into());
         }
-        
-        // 跳过 is_paused 检查 (兼容旧版结构)
 
         if amount == 0 {
             return Err(VaultError::InvalidAmount.into());
@@ -664,7 +703,10 @@ impl Processor {
     /// 2. 验证用户余额充足
     /// 3. 扣除用户余额
     /// 
-    /// 注意：Relayer 负责在 Solana 主网/Arbitrum 给用户转账
+    /// OC-L5: RelayerWithdraw intentionally skips `is_paused` check.
+    /// Rationale: Same as RelayerDeposit — governance-authorized operations bypass pause.
+    /// During pause, the bridge relayer must still be able to execute pending withdrawals
+    /// that have already been committed on the source chain.
     fn process_relayer_withdraw(
         program_id: &Pubkey,
         accounts: &[AccountInfo],
@@ -681,24 +723,12 @@ impl Processor {
         assert_signer(governance_authority)?;
         assert_writable(user_account_info)?;
 
-        // 2. 验证 governance authority 权限
-        // 兼容旧版 VaultConfig：直接读取 governance_authority 字段 (offset 8, 32 bytes)
+        // OC-H2: Verify signer is governance_authority or authorized_caller
         let vault_config_data = vault_config_info.data.borrow();
-        if vault_config_data.len() < 40 {
-            msg!("❌ Invalid VaultConfig data length: {}", vault_config_data.len());
-            return Err(VaultError::InvalidAccount.into());
-        }
-        
-        // VaultConfig 结构: discriminator (8) + governance_authority (32) + ...
-        let stored_governance_authority = Pubkey::try_from(&vault_config_data[8..40])
-            .map_err(|_| VaultError::InvalidAccount)?;
-        
-        if stored_governance_authority != *governance_authority.key {
-            msg!("❌ Invalid relayer: {} (expected governance_authority: {})", governance_authority.key, stored_governance_authority);
+        if !VaultConfig::is_valid_relayer_from_bytes(&vault_config_data, governance_authority.key) {
+            msg!("❌ Invalid relayer: {} (not governance_authority nor authorized_caller)", governance_authority.key);
             return Err(VaultError::InvalidRelayer.into());
         }
-        
-        // 跳过 is_paused 检查 (兼容旧版结构)
 
         if amount == 0 {
             return Err(VaultError::InvalidAmount.into());
@@ -717,10 +747,10 @@ impl Processor {
             return Err(VaultError::NotInitialized.into());
         }
 
-        // 5. 扣除用户余额
+        // 5. 扣除用户余额 (OC-M2 discriminator check)
+        deserialize_checked(&user_account_info.data.borrow(), UserAccount::DISCRIMINATOR)?;
         let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
         
-        // 验证钱包地址匹配
         if user_account.wallet != user_wallet {
             msg!("❌ Wallet mismatch: expected {}, got {}", user_wallet, user_account.wallet);
             return Err(VaultError::InvalidAccount.into());
@@ -781,17 +811,18 @@ impl Processor {
         assert_writable(vault_token_account)?;
         assert_writable(relayer_token_account)?;
 
-        let vault_config_data = vault_config_info.data.borrow();
-        if vault_config_data.len() < 40 {
-            msg!("❌ Invalid VaultConfig data length: {}", vault_config_data.len());
+        // V-3: Verify VaultConfig PDA (must match other entrypoints, e.g. process_deposit / process_withdraw)
+        let (expected_vault_config_pda, _) =
+            Pubkey::find_program_address(&[b"vault_config"], program_id);
+        if vault_config_info.key != &expected_vault_config_pda {
+            msg!("❌ Invalid VaultConfig PDA");
             return Err(VaultError::InvalidAccount.into());
         }
 
-        let stored_governance_authority = Pubkey::try_from(&vault_config_data[8..40])
-            .map_err(|_| VaultError::InvalidAccount)?;
-
-        if stored_governance_authority != *governance_authority.key {
-            msg!("❌ Invalid relayer: {} (expected governance_authority: {})", governance_authority.key, stored_governance_authority);
+        // OC-H2: Verify signer is governance_authority or authorized_caller
+        let vault_config_data = vault_config_info.data.borrow();
+        if !VaultConfig::is_valid_relayer_from_bytes(&vault_config_data, governance_authority.key) {
+            msg!("❌ Invalid relayer: {} (not governance_authority nor authorized_caller)", governance_authority.key);
             return Err(VaultError::InvalidRelayer.into());
         }
 
@@ -813,6 +844,7 @@ impl Processor {
             return Err(VaultError::NotInitialized.into());
         }
 
+        deserialize_checked(&user_account_info.data.borrow(), UserAccount::DISCRIMINATOR)?;
         let mut user_account = deserialize_account::<UserAccount>(&user_account_info.data.borrow())?;
 
         if user_account.wallet != user_wallet {
@@ -994,6 +1026,11 @@ impl Processor {
             return Err(VaultError::InvalidPda.into());
         }
 
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.is_paused {
+            return Err(VaultError::VaultPaused.into());
+        }
+
         // S-2: Verify vault_token_account is owned by vault_config PDA (prevents
         // attackers from passing their own token account as the deposit destination).
         // SPL Token Account layout: [mint(32), owner(32), ...]. The owner at bytes
@@ -1083,8 +1120,21 @@ impl Processor {
             return Err(VaultError::InvalidAccount.into());
         }
 
+        let (vault_config_pda, vault_config_bump) =
+            Pubkey::find_program_address(&[b"vault_config"], program_id);
+        if vault_config_info.key != &vault_config_pda {
+            msg!("❌ Invalid VaultConfig PDA");
+            return Err(VaultError::InvalidPda.into());
+        }
+
+        let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
+        if vault_config.is_paused {
+            return Err(VaultError::VaultPaused.into());
+        }
+
         Self::verify_spot_balance_pda(balance_pda_info, program_id, user.key, account_index, token_index)?;
 
+        deserialize_checked(&balance_pda_info.data.borrow(), SpotTokenBalance::DISCRIMINATOR)?;
         let mut balance = deserialize_account::<SpotTokenBalance>(&balance_pda_info.data.borrow())?;
         if balance.available_e6 < amount_e6 {
             msg!("❌ Insufficient balance: available_e6={}, required_e6={}", balance.available_e6, amount_e6);
@@ -1093,11 +1143,6 @@ impl Processor {
 
         balance.available_e6 = checked_sub(balance.available_e6, amount_e6)?;
         balance.last_update_ts = solana_program::clock::Clock::get()?.unix_timestamp;
-
-        let (vault_config_pda, vault_config_bump) = Pubkey::find_program_address(&[b"vault_config"], program_id);
-        if vault_config_info.key != &vault_config_pda {
-            return Err(VaultError::InvalidPda.into());
-        }
 
         // S-3: Verify vault_token_account is owned by vault_config PDA
         let vault_ta_data = vault_token_account.try_borrow_data()?;
@@ -1167,8 +1212,11 @@ impl Processor {
 
         assert_signer(governance_authority)?;
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        if vault_config.governance_authority != *governance_authority.key {
-            return Err(VaultError::UnauthorizedGovernanceAuthority.into());
+        // OC-H2: Accept governance_authority OR authorized_caller
+        if vault_config.governance_authority != *governance_authority.key
+            && !vault_config.is_authorized_caller(governance_authority.key)
+        {
+            return Err(VaultError::InvalidRelayer.into());
         }
 
         let bump = Self::verify_spot_balance_pda(balance_pda_info, program_id, &user_wallet, account_index, token_index)?;
@@ -1213,11 +1261,15 @@ impl Processor {
 
         assert_signer(governance_authority)?;
         let vault_config = deserialize_account::<VaultConfig>(&vault_config_info.data.borrow())?;
-        if vault_config.governance_authority != *governance_authority.key {
-            return Err(VaultError::UnauthorizedGovernanceAuthority.into());
+        // OC-H2: Accept governance_authority OR authorized_caller
+        if vault_config.governance_authority != *governance_authority.key
+            && !vault_config.is_authorized_caller(governance_authority.key)
+        {
+            return Err(VaultError::InvalidRelayer.into());
         }
 
         Self::verify_spot_balance_pda(balance_pda_info, program_id, &user_wallet, account_index, token_index)?;
+        deserialize_checked(&balance_pda_info.data.borrow(), SpotTokenBalance::DISCRIMINATOR)?;
         let mut balance = deserialize_account::<SpotTokenBalance>(&balance_pda_info.data.borrow())?;
         if balance.available_e6 < amount_e6 {
             msg!("❌ Insufficient balance: available_e6={}, required_e6={}", balance.available_e6, amount_e6);
@@ -1324,10 +1376,9 @@ impl Processor {
         if vault_config_data.len() < 40 {
             return Err(VaultError::InvalidAccount.into());
         }
-        let stored_governance_authority = Pubkey::try_from(&vault_config_data[8..40])
-            .map_err(|_| VaultError::InvalidAccount)?;
-        if stored_governance_authority != *governance_authority.key {
-            msg!("UserAccount: invalid relayer {} (expected {})", governance_authority.key, stored_governance_authority);
+        // OC-H2: Verify signer is governance_authority or authorized_caller
+        if !VaultConfig::is_valid_relayer_from_bytes(&vault_config_data, governance_authority.key) {
+            msg!("UserAccount: invalid relayer {} (not governance_authority nor authorized_caller)", governance_authority.key);
             return Err(VaultError::InvalidRelayer.into());
         }
 
@@ -1419,10 +1470,9 @@ impl Processor {
         if vault_config_data.len() < 40 {
             return Err(VaultError::InvalidAccount.into());
         }
-        let stored_governance_authority = Pubkey::try_from(&vault_config_data[8..40])
-            .map_err(|_| VaultError::InvalidAccount)?;
-        if stored_governance_authority != *governance_authority.key {
-            msg!("SpotTokenBalance: invalid relayer {} (expected {})", governance_authority.key, stored_governance_authority);
+        // OC-H2: Verify signer is governance_authority or authorized_caller
+        if !VaultConfig::is_valid_relayer_from_bytes(&vault_config_data, governance_authority.key) {
+            msg!("SpotTokenBalance: invalid relayer {} (not governance_authority nor authorized_caller)", governance_authority.key);
             return Err(VaultError::InvalidRelayer.into());
         }
 

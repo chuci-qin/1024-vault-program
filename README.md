@@ -6,13 +6,13 @@ User fund custody program for the 1024 DEX platform.
 
 **DB-First + On-chain Real-time Audit.** The Vault Program is one of only two active on-chain programs:
 
-- **Vault Program** — Fund custody (deposit, withdraw, balance mirrors)
-- **Exchange Program** — Immutable audit records (trades, positions, liquidations)
+- **Vault Program** — Fund custody (deposit, withdraw, balance state)
+- **Exchange Program** — Immutable audit trail (trades, positions, liquidations)
 
 All trading logic executes in the backend database. The Vault Program handles:
 
 1. **Real SPL Token transfers** — User deposit/withdraw, Spot deposit/withdraw, Relayer-assisted cross-chain
-2. **On-chain state mirrors** — UserAccount and SpotTokenBalance PDAs reflect DB state (idempotent, set-to-value)
+2. **On-chain state** — UserAccount and SpotTokenBalance PDAs reflect DB state (idempotent, set-to-value)
 3. **Governance operations** — Pause/resume, authorized caller management, authority transfer
 
 ## Instructions (18 variants)
@@ -34,8 +34,8 @@ All trading logic executes in the backend database. The Vault Program handles:
 | 12 | `RelayerSpotDeposit` | Relayer | Relayer-assisted Spot deposit (auto-init PDA) |
 | 13 | `RelayerSpotWithdraw` | Relayer | Relayer-assisted Spot withdrawal |
 | 14 | `RelayerWithdrawAndTransfer` | Relayer | Cross-chain bridge: debit UserAccount + transfer USDC to Relayer |
-| 15 | `UserAccount` | Relayer | Mirror UserAccount PDA to DB state (idempotent) |
-| 16 | `SpotTokenBalance` | Relayer | Mirror SpotTokenBalance PDA to DB state (idempotent) |
+| 15 | `UserAccount` | Relayer | Set UserAccount PDA to DB state (idempotent) |
+| 16 | `SpotTokenBalance` | Relayer | Set SpotTokenBalance PDA to DB state (idempotent) |
 | 17 | `MigrateVaultConfig` | Governance Authority | One-time V1 (569 bytes) to V2 (505 bytes) migration |
 
 ## PDA Seeds
