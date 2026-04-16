@@ -1,7 +1,7 @@
 //! Vault Program Instructions
 //!
 //! 18 active instructions for user fund custody.
-//! Only two on-chain programs remain: Vault (fund custody) + Exchange (audit records).
+//! Only two on-chain programs remain: Vault (fund custody) + Exchange (on-chain audit).
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::pubkey::Pubkey;
@@ -213,7 +213,7 @@ pub enum VaultInstruction {
         account_index: u8,
     },
 
-    /// Index 15: UserAccount mirror (Relayer-only, set-to-value)
+    /// Index 15: UserAccount state (Relayer-only, set-to-value)
     ///
     /// Sets UserAccount PDA fields to exact values (idempotent, not add/subtract).
     ///
@@ -231,7 +231,7 @@ pub enum VaultInstruction {
         oracle_locked_e6: i64,
     },
 
-    /// Index 16: SpotTokenBalance mirror (Relayer-only, set-to-value)
+    /// Index 16: SpotTokenBalance state (Relayer-only, set-to-value)
     ///
     /// Sets SpotTokenBalance PDA fields to exact values (idempotent).
     ///

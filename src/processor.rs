@@ -9,14 +9,14 @@
 //! | 1 | Core VaultSettlement | `process_initialize` ~ `process_withdraw` | 初始化、用户入金/出金 |
 //! | 2 | Relayer VaultSettlement | `process_relayer_deposit` ~ `process_relayer_withdraw_and_transfer` | 代理入金/出金（含跨链提取） |
 //! | 3 | Spot VaultSettlement | `process_spot_deposit` ~ `process_relayer_spot_withdraw` | Spot 资产入金/出金 |
-//! | 4 | Mirror | `process_user_account` ~ `process_spot_token_balance` | 链上 PDA 状态镜像 |
+//! | 4 | State  | `process_user_account` ~ `process_spot_token_balance` | 链上 PDA 状态写入 |
 //! | 5 | Governance Authority | `process_add_authorized_caller` ~ `process_migrate_vault_config` | 配置管理、升级迁移 |
 //!
 //! ## 架构要点
 //!
 //! - 只有托管出入金路径涉及真实 SPL Token 转账（用户/Relayer）
-//! - 链上仅保留托管与审计镜像；业务结算与资金计算在 DB 内完成
-//! - 镜像指令幂等地将状态写入链上
+//! - 链上仅保留托管与审计状态；业务结算与资金计算在 DB 内完成
+//! - 状态指令幂等地将状态写入链上
 
 use crate::{
     error::VaultError,
@@ -1338,10 +1338,10 @@ impl Processor {
     }
 
     // =========================================================================
-    // Mirror: 链上 PDA 状态镜像
+    // State: 链上 PDA 状态写入
     // =========================================================================
 
-    /// UserAccount PDA mirror (set-to-value, not increment).
+    /// UserAccount PDA state writer (set-to-value, not increment).
     /// Relayer-only.
     ///
     /// # Relayer Verification Design (H-3)
@@ -1446,7 +1446,7 @@ impl Processor {
         Ok(())
     }
 
-    /// SpotTokenBalance PDA mirror (set-to-value, not increment).
+    /// SpotTokenBalance PDA state writer (set-to-value, not increment).
     /// Relayer-only.
     fn process_spot_token_balance(
         program_id: &Pubkey,
