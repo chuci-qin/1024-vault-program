@@ -27,10 +27,10 @@ pub enum VaultInstruction {
     ///
     /// Accounts:
     /// 0. `[signer]` User
-    /// 1. `[writable]` UserAccount PDA (seeds: ["user", wallet, &[account_index]])
+    /// 1. `[writable]` UserAccount PDA (seeds: ["user", wallet, account_index_le_u32])
     /// 2. `[]` System Program
     InitializeUser {
-        account_index: u8,
+        account_index: u32,
     },
 
     /// Index 2: 入金
@@ -97,7 +97,7 @@ pub enum VaultInstruction {
 
     /// Index 8: Relayer 代理入金 (Governance Authority/Relayer only)
     ///
-    /// PDA seeds: ["user", user_wallet, &[account_index]]
+    /// PDA seeds: ["user", user_wallet, account_index_le_u32]
     ///
     /// Accounts:
     /// 0. `[signer]` Governance Authority/Relayer
@@ -107,12 +107,12 @@ pub enum VaultInstruction {
     RelayerDeposit {
         user_wallet: Pubkey,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
     },
 
     /// Index 9: Relayer 代理出金 (Governance Authority/Relayer only)
     ///
-    /// PDA seeds: ["user", user_wallet, &[account_index]]
+    /// PDA seeds: ["user", user_wallet, account_index_le_u32]
     ///
     /// Accounts:
     /// 0. `[signer]` Governance Authority/Relayer
@@ -121,7 +121,7 @@ pub enum VaultInstruction {
     RelayerWithdraw {
         user_wallet: Pubkey,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
     },
 
     /// Index 10: Spot Token 入金 (用户直接调用)
@@ -139,7 +139,7 @@ pub enum VaultInstruction {
     SpotDeposit {
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     },
 
@@ -157,7 +157,7 @@ pub enum VaultInstruction {
     SpotWithdraw {
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     },
 
@@ -174,7 +174,7 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     },
 
@@ -188,7 +188,7 @@ pub enum VaultInstruction {
         user_wallet: Pubkey,
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     },
 
@@ -210,7 +210,7 @@ pub enum VaultInstruction {
     RelayerWithdrawAndTransfer {
         user_wallet: Pubkey,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
     },
 
     /// Index 15: UserAccount state (Relayer-only, set-to-value)
@@ -224,7 +224,7 @@ pub enum VaultInstruction {
     /// 3. `[]` System Program (for auto-init if PDA doesn't exist)
     UserAccount {
         user_wallet: Pubkey,
-        account_index: u8,
+        account_index: u32,
         available_balance_e6: i64,
         locked_margin_e6: i64,
         spot_locked_e6: i64,
@@ -242,7 +242,7 @@ pub enum VaultInstruction {
     /// 3. `[]` System Program (for auto-init if PDA doesn't exist)
     SpotTokenBalance {
         user_wallet: Pubkey,
-        account_index: u8,
+        account_index: u32,
         token_index: u16,
         available_e6: i64,
         locked_e6: i64,

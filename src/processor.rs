@@ -214,7 +214,7 @@ impl Processor {
     }
 
     /// 处理初始化用户账户
-    fn process_initialize_user(program_id: &Pubkey, accounts: &[AccountInfo], account_index: u8) -> ProgramResult {
+    fn process_initialize_user(program_id: &Pubkey, accounts: &[AccountInfo], account_index: u32) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let user = next_account_info(account_info_iter)?;
         let user_account_info = next_account_info(account_info_iter)?;
@@ -232,6 +232,7 @@ impl Processor {
         let space = USER_ACCOUNT_SIZE;
         let lamports = rent.minimum_balance(space);
 
+        let account_index_bytes = account_index.to_le_bytes();
         invoke_signed(
             &system_instruction::create_account(
                 user.key,
@@ -241,7 +242,7 @@ impl Processor {
                 program_id,
             ),
             &[user.clone(), user_account_info.clone()],
-            &[&[b"user", user.key.as_ref(), &[account_index], &[bump]]],
+            &[&[b"user", user.key.as_ref(), &account_index_bytes, &[bump]]],
         )?;
 
         let user_account = UserAccount {
@@ -257,7 +258,7 @@ impl Processor {
             spot_locked_e6: 0,
             account_index,
             oracle_locked_e6: 0,
-            reserved: [0; 47],
+            reserved: [0; 44],
         };
 
         user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
@@ -590,7 +591,7 @@ impl Processor {
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let governance_authority = next_account_info(account_info_iter)?;
@@ -640,6 +641,7 @@ impl Processor {
             let space = USER_ACCOUNT_SIZE;
             let lamports = rent.minimum_balance(space);
 
+            let account_index_bytes = account_index.to_le_bytes();
             invoke_signed(
                 &system_instruction::create_account(
                     governance_authority.key,
@@ -649,7 +651,7 @@ impl Processor {
                     program_id,
                 ),
                 &[governance_authority.clone(), user_account_info.clone(), system_program.clone()],
-                &[&[b"user", user_wallet.as_ref(), &[account_index], &[bump]]],
+                &[&[b"user", user_wallet.as_ref(), &account_index_bytes, &[bump]]],
             )?;
 
             // 初始化新账户
@@ -666,7 +668,7 @@ impl Processor {
                 spot_locked_e6: 0,
                 account_index,
                 oracle_locked_e6: 0,
-                reserved: [0; 47],
+                reserved: [0; 44],
             };
             user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
 
@@ -712,7 +714,7 @@ impl Processor {
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let governance_authority = next_account_info(account_info_iter)?;
@@ -792,7 +794,7 @@ impl Processor {
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
     ) -> ProgramResult {
         let account_info_iter = &mut accounts.iter();
         let governance_authority = next_account_info(account_info_iter)?;
@@ -897,7 +899,7 @@ impl Processor {
         account_info: &AccountInfo,
         program_id: &Pubkey,
         wallet: &Pubkey,
-        account_index: u8,
+        account_index: u32,
         token_index: u16,
     ) -> Result<u8, ProgramError> {
         let (expected_pda, bump) = derive_spot_token_balance_pda_with_index(program_id, wallet, account_index, token_index);
@@ -917,7 +919,7 @@ impl Processor {
         system_program: &AccountInfo<'a>,
         program_id: &Pubkey,
         wallet: &Pubkey,
-        account_index: u8,
+        account_index: u32,
         token_index: u16,
         bump: u8,
     ) -> Result<SpotTokenBalance, ProgramError> {
@@ -930,10 +932,11 @@ impl Processor {
         let space = SPOT_TOKEN_BALANCE_SIZE;
         let lamports = rent.minimum_balance(space);
 
+        let account_index_bytes = account_index.to_le_bytes();
         let seeds: &[&[u8]] = &[
             SPOT_BALANCE_SEED,
             wallet.as_ref(),
-            &[account_index],
+            &account_index_bytes,
             &token_index.to_le_bytes(),
             &[bump],
         ];
@@ -946,6 +949,7 @@ impl Processor {
                     &[payer.clone(), balance_account.clone(), system_program.clone()],
                 )?;
             }
+            let account_index_bytes = account_index.to_le_bytes();
             invoke_signed(
                 &system_instruction::allocate(balance_account.key, space as u64),
                 &[balance_account.clone(), system_program.clone()],
@@ -989,7 +993,7 @@ impl Processor {
         accounts: &[AccountInfo],
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     ) -> ProgramResult {
         if token_index == 0 {
@@ -1091,7 +1095,7 @@ impl Processor {
         accounts: &[AccountInfo],
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     ) -> ProgramResult {
         if token_index == 0 {
@@ -1191,7 +1195,7 @@ impl Processor {
         user_wallet: Pubkey,
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     ) -> ProgramResult {
         if token_index == 0 {
@@ -1241,7 +1245,7 @@ impl Processor {
         user_wallet: Pubkey,
         token_index: u16,
         amount: u64,
-        account_index: u8,
+        account_index: u32,
         amount_e6: i64,
     ) -> ProgramResult {
         if token_index == 0 {
@@ -1357,7 +1361,7 @@ impl Processor {
         program_id: &Pubkey,
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
-        account_index: u8,
+        account_index: u32,
         available_balance_e6: i64,
         locked_margin_e6: i64,
         spot_locked_e6: i64,
@@ -1388,6 +1392,7 @@ impl Processor {
         }
 
         if user_account_info.data_is_empty() {
+            let account_index_bytes = account_index.to_le_bytes();
             let rent = Rent::get()?;
             let space = USER_ACCOUNT_SIZE;
             let lamports = rent.minimum_balance(space);
@@ -1401,7 +1406,7 @@ impl Processor {
                     program_id,
                 ),
                 &[governance_authority.clone(), user_account_info.clone(), system_program.clone()],
-                &[&[b"user", user_wallet.as_ref(), &[account_index], &[bump]]],
+                &[&[b"user", user_wallet.as_ref(), &account_index_bytes, &[bump]]],
             )?;
 
             let user_account = UserAccount {
@@ -1417,7 +1422,7 @@ impl Processor {
                 spot_locked_e6,
                 account_index,
                 oracle_locked_e6,
-                reserved: [0; 47],
+                reserved: [0; 44],
             };
             user_account.serialize(&mut &mut user_account_info.data.borrow_mut()[..])?;
         } else {
@@ -1452,7 +1457,7 @@ impl Processor {
         program_id: &Pubkey,
         accounts: &[AccountInfo],
         user_wallet: Pubkey,
-        account_index: u8,
+        account_index: u32,
         token_index: u16,
         available_e6: i64,
         locked_e6: i64,

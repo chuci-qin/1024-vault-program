@@ -50,7 +50,7 @@ async fn test_initialize_user() {
     
     banks_client.process_transaction(airdrop_tx).await.unwrap();
 
-    // 派生UserAccount PDA (seeds: ["user", wallet, &[account_index]])
+    // 派生UserAccount PDA (seeds: ["user", wallet, account_index_le_u32])
     let (user_account_pda, _bump) = UserAccount::derive_pda(&program_id, &user.pubkey(), 0);
 
     // 创建InitializeUser指令
@@ -107,7 +107,7 @@ async fn test_state_calculations() {
         spot_locked_e6: 100_000_000,        // 100 USDC (One Account Experience)
         account_index: 0,
         oracle_locked_e6: 0,
-        reserved: [0; 47],
+        reserved: [0; 44],
     };
 
     // equity = available + locked_margin + spot_locked + unrealized_pnl

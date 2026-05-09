@@ -43,8 +43,8 @@ All trading logic executes in the backend database. The Vault Program handles:
 | Account | Seeds | Size |
 |---------|-------|:----:|
 | VaultConfig | `["vault_config"]` | 505 bytes |
-| UserAccount | `["user", wallet, &[account_index]]` | 153 bytes |
-| SpotTokenBalance | `["spot_balance", wallet, &[account_index], token_index.to_le_bytes()]` | 98 bytes |
+| UserAccount | `["user", wallet, account_index_le_u32]` | 153 bytes |
+| SpotTokenBalance | `["spot_balance", wallet, account_index_le_u32, token_index.to_le_bytes()]` | 98 bytes |
 
 ## State Structs
 
@@ -54,7 +54,7 @@ Global program configuration. Stores governance authority, USDC mint, vault toke
 
 ### UserAccount (153 bytes)
 
-Per-user per-sub-account balance state. Fields: `available_balance_e6`, `locked_margin_e6`, `spot_locked_e6`, `oracle_locked_e6`, `unrealized_pnl_e6`, etc. `account_index=0` is the main account; 1-255 are sub-accounts.
+Per-user per-sub-account balance state. Fields: `available_balance_e6`, `locked_margin_e6`, `spot_locked_e6`, `oracle_locked_e6`, `unrealized_pnl_e6`, etc. `account_index=0` is the main account; non-main accounts use a monotonically increasing u32 index.
 
 ### SpotTokenBalance (98 bytes)
 

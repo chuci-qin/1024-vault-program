@@ -28,8 +28,8 @@ pub const VAULT_CONFIG_SIZE: usize = 8 + // discriminator
 
 /// UserAccount 账户大小 (bytes)
 ///
-/// Layout (153 bytes total, unchanged from V1):
-///   disc(8) + wallet(32) + bump(1) + 7×i64(56) + account_index(1) + oracle_locked_e6(8) + reserved(47)
+/// Layout (153 bytes total):
+///   disc(8) + wallet(32) + bump(1) + 7×i64(56) + account_index(4) + oracle_locked_e6(8) + reserved(44)
 pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
     32 + // wallet
     1 + // bump
@@ -40,9 +40,9 @@ pub const USER_ACCOUNT_SIZE: usize = 8 + // discriminator
     8 + // total_withdrawn_e6
     8 + // last_update_ts
     8 + // spot_locked_e6 (One Account Experience)
-    1 + // account_index (V2: sub-account isolation)
+    4 + // account_index (u32: sub-account isolation)
     8 + // oracle_locked_e6 (V2: PM Oracle bond)
-    47; // reserved (was 56, reduced by 1+8 for account_index+oracle_locked)
+    44; // reserved (was 56, reduced by 4+8 for account_index+oracle_locked)
 
 /// Vault 全局配置 (505 bytes)
 ///
@@ -127,10 +127,10 @@ impl VaultConfig {
 }
 
 /// 用户账户 (PDA)
-/// Seeds: ["user", wallet, &[account_index]]
+/// Seeds: ["user", wallet, account_index_le_u32]
 /// 
 /// 记录单个用户/子账户的保证金状态。
-/// account_index=0 为主账户，1-255 为子账户。
+/// account_index=0 为主账户，非主账户使用 u32 递增索引。
 #[derive(BorshSerialize, BorshDeserialize, Debug, Clone)]
 pub struct UserAccount {
     /// 账户类型标识符
@@ -166,19 +166,18 @@ pub struct UserAccount {
     /// 而是直接在 UserAccount 内通过 available ↔ spot_locked 字段搬运。
     pub spot_locked_e6: i64,
     
-    /// Sub-account index (V2).
-    /// 0 = main account, 1-255 = sub-accounts.
+    /// Sub-account index.
+    /// 0 = main account; non-main accounts use a monotonically increasing u32 sequence.
     /// Included in PDA seeds for per-account isolation.
-    /// Borsh-compatible: old PDAs had reserved[8]=0 → account_index=0 (main).
-    pub account_index: u8,
+    pub account_index: u32,
     
     /// Legacy oracle bond locked amount (e6, V2 compatibility field).
     /// LockBond/ReleaseBond instruction paths are legacy-disabled in DB-First mode.
     /// Borsh-compatible: old PDAs had reserved[9..17]=0 → oracle_locked_e6=0.
     pub oracle_locked_e6: i64,
     
-    /// 预留字段 (扩展用) — from 56 → 47 (1+8 carved for account_index + oracle_locked)
-    pub reserved: [u8; 47],
+    /// 预留字段 (扩展用) — from 56 → 44 (4+8 carved for account_index+oracle_locked)
+    pub reserved: [u8; 44],
 }
 
 impl UserAccount {
@@ -187,10 +186,11 @@ impl UserAccount {
     pub const USER_SEED: &'static [u8] = b"user";
     
     /// Derive UserAccount PDA address.
-    /// Seeds: ["user", wallet, &[account_index]]
-    pub fn derive_pda(program_id: &Pubkey, wallet: &Pubkey, account_index: u8) -> (Pubkey, u8) {
+    /// Seeds: ["user", wallet, account_index_le_u32]
+    pub fn derive_pda(program_id: &Pubkey, wallet: &Pubkey, account_index: u32) -> (Pubkey, u8) {
+        let account_index_bytes = account_index.to_le_bytes();
         Pubkey::find_program_address(
-            &[Self::USER_SEED, wallet.as_ref(), &[account_index]],
+            &[Self::USER_SEED, wallet.as_ref(), &account_index_bytes],
             program_id,
         )
     }
@@ -218,7 +218,7 @@ impl UserAccount {
 // Decision: Plan A — SpotUserAccount completely deleted, no header, no sequence check.
 //
 // Each (wallet, account_index, token_index) triple gets its own PDA, auto-created on first use.
-// PDA seeds: ["spot_balance", wallet, &[account_index], token_index.to_le_bytes()]
+// PDA seeds: ["spot_balance", wallet, account_index_le_u32, token_index.to_le_bytes()]
 
 /// SpotTokenBalance discriminator — "SPTK_BAL" in ASCII hex
 pub const SPOT_TOKEN_BALANCE_DISCRIMINATOR: u64 = 0x5350544B5F42414C;
@@ -331,18 +331,19 @@ pub fn derive_spot_token_balance_pda(
 
 /// Derive SpotTokenBalance PDA address with explicit account_index.
 ///
-/// Seeds: ["spot_balance", wallet, &[account_index], token_index.to_le_bytes()]
+/// Seeds: ["spot_balance", wallet, account_index_le_u32, token_index.to_le_bytes()]
 pub fn derive_spot_token_balance_pda_with_index(
     program_id: &Pubkey,
     wallet: &Pubkey,
-    account_index: u8,
+    account_index: u32,
     token_index: u16,
 ) -> (Pubkey, u8) {
+    let account_index_bytes = account_index.to_le_bytes();
     Pubkey::find_program_address(
         &[
             SPOT_BALANCE_SEED,
             wallet.as_ref(),
-            &[account_index],
+            &account_index_bytes,
             &token_index.to_le_bytes(),
         ],
         program_id,
@@ -369,7 +370,7 @@ mod tests {
             spot_locked_e6: 300_000_000,
             account_index: 0,
             oracle_locked_e6: 100_000_000,
-            reserved: [0; 47],
+            reserved: [0; 44],
         };
         
         // equity = available(1000) + locked_margin(500) + spot_locked(300) + oracle_locked(100) + upnl(200) = 2100
@@ -391,10 +392,10 @@ mod tests {
             spot_locked_e6: 0,
             account_index: 0,
             oracle_locked_e6: 0,
-            reserved: [0; 47],
+            reserved: [0; 44],
         };
         let serialized = borsh::to_vec(&account).unwrap();
-        // 8(disc) + 32(wallet) + 1(bump) + 7*i64(56) + 1(account_index) + 8(oracle_locked) + 47(reserved) = 153
+        // 8(disc) + 32(wallet) + 1(bump) + 7*i64(56) + 4(account_index) + 8(oracle_locked) + 44(reserved) = 153
         assert_eq!(serialized.len(), 153, "UserAccount size must remain 153 bytes");
     }
     

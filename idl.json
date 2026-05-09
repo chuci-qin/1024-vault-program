@@ -27,7 +27,7 @@
         { "name": "systemProgram", "isMut": false, "isSigner": false }
       ],
       "args": [
-        { "name": "accountIndex", "type": "u8" }
+        { "name": "accountIndex", "type": "u32" }
       ]
     },
     {
@@ -116,7 +116,7 @@
       "args": [
         { "name": "userWallet", "type": "publicKey" },
         { "name": "amount", "type": "u64" },
-        { "name": "accountIndex", "type": "u8" }
+        { "name": "accountIndex", "type": "u32" }
       ]
     },
     {
@@ -130,7 +130,7 @@
       "args": [
         { "name": "userWallet", "type": "publicKey" },
         { "name": "amount", "type": "u64" },
-        { "name": "accountIndex", "type": "u8" }
+        { "name": "accountIndex", "type": "u32" }
       ]
     },
     {
@@ -148,7 +148,7 @@
       "args": [
         { "name": "tokenIndex", "type": "u16" },
         { "name": "amount", "type": "u64" },
-        { "name": "accountIndex", "type": "u8" },
+        { "name": "accountIndex", "type": "u32" },
         { "name": "amountE6", "type": "i64" }
       ]
     },
@@ -166,7 +166,7 @@
       "args": [
         { "name": "tokenIndex", "type": "u16" },
         { "name": "amount", "type": "u64" },
-        { "name": "accountIndex", "type": "u8" },
+        { "name": "accountIndex", "type": "u32" },
         { "name": "amountE6", "type": "i64" }
       ]
     },
@@ -183,7 +183,7 @@
         { "name": "userWallet", "type": "publicKey" },
         { "name": "tokenIndex", "type": "u16" },
         { "name": "amount", "type": "u64" },
-        { "name": "accountIndex", "type": "u8" },
+        { "name": "accountIndex", "type": "u32" },
         { "name": "amountE6", "type": "i64" }
       ]
     },
@@ -199,7 +199,7 @@
         { "name": "userWallet", "type": "publicKey" },
         { "name": "tokenIndex", "type": "u16" },
         { "name": "amount", "type": "u64" },
-        { "name": "accountIndex", "type": "u8" },
+        { "name": "accountIndex", "type": "u32" },
         { "name": "amountE6", "type": "i64" }
       ]
     },
@@ -217,7 +217,7 @@
       "args": [
         { "name": "userWallet", "type": "publicKey" },
         { "name": "amount", "type": "u64" },
-        { "name": "accountIndex", "type": "u8" }
+        { "name": "accountIndex", "type": "u32" }
       ]
     },
     {
@@ -231,7 +231,7 @@
       ],
       "args": [
         { "name": "userWallet", "type": "publicKey" },
-        { "name": "accountIndex", "type": "u8" },
+        { "name": "accountIndex", "type": "u32" },
         { "name": "availableBalanceE6", "type": "i64" },
         { "name": "lockedMarginE6", "type": "i64" },
         { "name": "spotLockedE6", "type": "i64" },
@@ -249,7 +249,7 @@
       ],
       "args": [
         { "name": "userWallet", "type": "publicKey" },
-        { "name": "accountIndex", "type": "u8" },
+        { "name": "accountIndex", "type": "u32" },
         { "name": "tokenIndex", "type": "u16" },
         { "name": "availableE6", "type": "i64" },
         { "name": "lockedE6", "type": "i64" }

@@ -24,9 +24,10 @@ fn derive_balance_pda(program_id: &Pubkey, wallet: &Pubkey, token_index: u16) ->
     derive_balance_pda_with_index(program_id, wallet, 0, token_index)
 }
 
-fn derive_balance_pda_with_index(program_id: &Pubkey, wallet: &Pubkey, account_index: u8, token_index: u16) -> (Pubkey, u8) {
+fn derive_balance_pda_with_index(program_id: &Pubkey, wallet: &Pubkey, account_index: u32, token_index: u16) -> (Pubkey, u8) {
+    let account_index_bytes = account_index.to_le_bytes();
     Pubkey::find_program_address(
-        &[b"spot_balance", wallet.as_ref(), &[account_index], &token_index.to_le_bytes()],
+        &[b"spot_balance", wallet.as_ref(), &account_index_bytes, &token_index.to_le_bytes()],
         program_id,
     )
 }
